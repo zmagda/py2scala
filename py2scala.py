@@ -73,9 +73,10 @@ if statements and other block openers that stretch across multiple lines.
 parser = optparse.OptionParser(usage=usage)
 parser.add_option("-s", "--remove-self", action="store_true",
                    help="""Remove self.* references and self params.
-Not done by default because it removes info necessary for manually converting
-classes (especially constructors).  Useful to rerun this program with this
-option after all constructors have been converted by hand.""")
+Also removes cls.* references and cls params.   Not done by default because
+it removes info necessary for manually converting classes (especially
+constructors) and separating class methods into companion objects.  Useful
+to rerun this program with this option after these things have been done.""")
 parser.add_option("-b", "--convert-brackets", action="store_true",
                    help="""Try to convert array refs like foo[i] to Scala-style foo(i).
 Not done by default because it removes info useful for adding type annotations
@@ -273,20 +274,15 @@ def modline(split):
       if options.remove_self:
         vv = re.sub(r'\bself\.', '', vv)
         vv = re.sub(r'\bself\b', 'this', vv)
+        vv = re.sub(r'\bcls\.', '', vv)
+        # Not sure about this
+        #vv = re.sub(r'\bcls\b', 'this', vv)
       if options.convert_brackets:
         # Convert bracketed expressions, but avoid list constructors
         # (previous character not alphanumeric) and scala generic vars/types
         # (the type in brackets is usually uppercase)
         vv = re.sub(r'([A-Za-z0-9_])\[([^A-Z\]]%s)\]' % bal2str0,
             r'\1(\2)', vv)
-
-      # Also maybe questionable; might want to preserve these, to know when
-      # class fields are being assigned/referenced (e.g. vs. params of the
-      # same name)
-      # Causes lots of warnings due to typical use of __init__ funs with
-      # params having same name as fields; can just do manual search/replace
-      # to fix these.
-      # val = re.sub(r'\bself\.', '', val)
 
       yield vv
 
@@ -352,7 +348,7 @@ for line in fileinput.input(args):
     continue
 
   if options.remove_self:
-    m = re.match(r'^( *def +[A-Za-z0-9_]+)\(self(\)|, *)(.*)$', line)
+    m = re.match(r'^( *def +[A-Za-z0-9_]+)\((?:self|cls)(\)|, *)(.*)$', line)
     if m:
       if m.group(2) == ')':
         line = '%s()%s' % (m.group(1), m.group(3))
