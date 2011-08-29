@@ -316,14 +316,18 @@ paren_mismatch = 0
 zero_mismatch_indent = 0
 # Line # last time paren mismatch was zero
 zero_mismatch_lineno = 0
-# Accumulation of line across paren mismatches
+# Accumulation of line across paren mismatches and multi-line quotes.
+# This will hold the concatenation of all such lines, so that we can
+# properly handle multi-line if/def/etc. statements and variable assignments.
 bigline = None
 # Accumulation of unfrobbed line across paren mismatches
 old_bigline = None
 # Lineno and indent at start of bigline
 bigline_indent = 0
 bigline_lineno = 0
-# Current line number
+# Current source line number.  Note the same as a "line index", which is an
+# index into the lines[] array. (Not even simply off by 1, because we
+# add extra lines consisting of braces, and do other such changes.)
 lineno = 0
 # Lines accumulated so far.  We need to be able to go back and modify old
 # lines sometimes.  Note that len(lines) is the "line index" of the
@@ -352,7 +356,12 @@ class Indent:
 class Define:
   # ty: "class" or "def"
   # name: name of class or def
-  # vardict: dict of currently active params and local vars
+  # vardict: dict of currently active params and local vars.  The key is
+  #   a variable name and the value is one of "val" (unsettable function
+  #   parameter), "var" (settable function parameter), "explicit"
+  #   (variable declared with an explicit var/val) or a line number
+  #   (bare variable assignment; the line number is so that we can change
+  #   an added 'val' to 'var' if necessary).
   def __init__(self, ty, name, vardict):
     self.ty = ty
     self.name = name
@@ -426,9 +435,11 @@ for line in fileinput.input(args):
   # Count # of mismatched parens
   for i in xrange(len(splitline)):
     vv = splitline[i]
-    if i % 2 == 0:
-      # Not a delimiter
-      paren_mismatch += vv.count('(') - vv.count(')')
+    if i % 2 == 0: # Make sure not a quoted string or comment
+      # Count mismatch of parens and brackets.  We don't do braces because
+      # we might be processing Scala-like code.
+      paren_mismatch += vv.count('(') + vv.count('[') - \
+          vv.count(')') - vv.count(']')
   #debprint("Line %d, old paren mismatch %d, new paren mismatch %d",
   #    lineno, old_paren_mismatch, paren_mismatch)
   if paren_mismatch < 0:
@@ -520,21 +531,8 @@ for line in fileinput.input(args):
     bigline = bigline + "\n" + line_without_delim
     old_bigline = old_bigline + "\n" + old_line_without_delim
 
-  # Handle blocks.  We only want to check once per line, and Python
-  # unfortunately makes it rather awkward to do convenient if-then checks
-  # with regexps because there's no equivalent of
-  #
-  # if ((m = re.match(...))):
-  #   do something with m.groups()
-  # elif ((m = re.match(...))):
-  #   etc.
-  #
-  # Instead you need assignment and check on separate lines, and so all
-  # ways of chaining multiple regex matches will be awkward.  We choose
-  # to create an infinite loop and break after each match, or at the end.
-  # This almost directly mirrors the architecture of a C switch() statement.
-  #
-
+  # Handle blocks.
+  
   # If we see a Scala-style opening block, just note it; important for
   # unmatched-paren handling above (in particular where we reset the
   # unmatched-paren count at the beginning of a block, to deal with
@@ -580,10 +578,14 @@ for line in fileinput.input(args):
   # Check for def/class and note function arguments.  We do this separately
   # from the def check below so we find both def and class, and both
   # Scala and Python style.
+
   m = re.match('\s*(def|class)\s+(.*?)(?:\((.*)\))?\s*(:\s*$|=?\s*\{ *$|extends\s.*|with\s.*|\s*$)', bigline, re.S)
   if m:
     (ty, name, allargs, coda) = m.groups()
     argdict = {}
+    # In Python class foo(bar): declarations, bar is a superclass, not
+    # parameters.  If Scala the equivalent decls are parameters, just like
+    # functions in both languages.
     python_style_class = ty == 'class' and coda and coda[0] == ':'
     if not python_style_class and allargs and allargs.strip():
       args = allargs.strip().split(',')
@@ -601,6 +603,21 @@ for line in fileinput.input(args):
     defs += [Define(ty, name, argdict)]
     #debprint("Adding args %s for function", argdict)
 
+  # Check for various types of blocks, and substitute.
+  # We only want to check once per line, and Python
+  # unfortunately makes it rather awkward to do convenient if-then checks
+  # with regexps because there's no equivalent of
+  #
+  # if ((m = re.match(...))):
+  #   do something with m.groups()
+  # elif ((m = re.match(...))):
+  #   etc.
+  #
+  # Instead you need assignment and check on separate lines, and so all
+  # ways of chaining multiple regex matches will be awkward.  We choose
+  # to create an infinite loop and break after each match, or at the end.
+  # This almost directly mirrors the architecture of a C switch() statement.
+  #
   newblock = None
   while True:
     if body:
@@ -672,27 +689,48 @@ for line in fileinput.input(args):
       if m:
         newblock = "class %s" % m.groups()
         break
-    # Check for assignments to variables inside of functions.  Add val/var
-    # to bare assignments to variables not yet seen.  If reassigning a
-    # variable, and we previously added a val, change it to var.  Don't
-    # do this if we're inside of a function call or similar (where the
-    # use of a named param looks like a variable assignment).
+
+    # Check for assignments and modifying assignments (e.g. +=) to variables
+    # inside of functions.  Add val/var to bare assignments to variables not
+    # yet seen.  Initially we add 'val', but if we later see the variable
+    # being reassigned or modified, we change it to 'var'.  Also look for
+    # self.* variables, but handle them differently.  For one,
+    # they logically belong to the class, not the function they're in,
+    # so we need to find the right dictionary to store them in.  Also,
+    # we don't add 'val' or 'var' to them unless we see them in __init__(),
+    # and in that case we move them outside the __init__() so they end up
+    # in class scope. Existing variables at class scope get moved to
+    # companion objects. (Note the following: Variables declared at class
+    # scope are instance variables in Scala, but class variables in Python.
+    # Instance variables in Python are set using assignments to self.*;
+    # class variables in Scala are stored in a companion object.)
+
     #debprint("About to check for vars, line %d, fun %s",
     #    lineno, defs and defs[-1].name)
     if defs and paren_mismatch == 0:
       dd = defs[-1]
       #debprint("Checking for vars, line %d, old_bigline[%s], bigline[%s]", lineno, old_bigline, bigline)
-      curvardict = dd.vardict
       # Make sure we see a variable assignment in both the unfrobbed and
       # frobbed lines, so that we ignore cases where we removed a `self.'.
-      assignre = re.compile('(\s*)(val\s+|var\s+|)([a-zA-Z_][a-zA-Z_0-9]*)(\s*=)(.*)', re.S)
+      assignre = re.compile('(\s*)(val\s+|var\s+|)((?:self\.)?[a-zA-Z_][a-zA-Z_0-9]*)(\s*[+\-*/]?=)(.*)', re.S)
       m = assignre.match(old_bigline)
       if m:
+        (_, _, newvar, _, _) = m.groups()
         m = assignre.match(bigline)
       if m:
-        #debprint("Saw var")
-        newvar = m.group(3)
-        if m.group(2):
+        (newindent, newvaldecl, _, neweq, newrhs) = m.groups()
+        #debprint("lineno: %d, Saw var: %s", lineno, newvar)
+        is_self = newvar.startswith("self.")
+        is_assign = neweq.strip() == '='
+        ok_to_var_self = is_self and dd.ty == 'def' and dd.name == '__init__'
+        curvardict = dd.vardict
+        if is_self:
+          # For a self.* variable, find the class vardict
+          i = len(defs) - 1
+          while i > 0 and defs[i].ty != 'class':
+            i -= 1
+            curvardict = defs[i].vardict
+        if newvaldecl:
           # Already seen val/var decl
           if newvar in curvardict:
             warning("Apparent redefinition of variable %s" % newvar)
@@ -702,16 +740,21 @@ for line in fileinput.input(args):
         else:
           #debprint("newvar: %s, curvardict: %s", newvar, curvardict)
           if newvar not in curvardict:
-            curvardict[newvar] = len(lines)
-            bigline = "%sval %s%s%s%s" % m.groups()
+            if not is_assign:
+              warning("Apparent attempt to modify non-existent variable %s" % newvar)
+            else:
+              curvardict[newvar] = len(lines)
+              if not is_self or ok_to_var_self:
+                bigline = "%sval %s%s%s%s" % (newindent, newvaldecl, newvar, neweq, newrhs)
           else:
             vardefline = curvardict[newvar]
             if vardefline == "val":
               warning("Attempt to set function parameter %s" % newvar)
             elif type(vardefline) is int:
+              #debprint("Subbing var for val in [%s]", lines[vardefline])
               lines[vardefline] = re.sub(r'^( *)val ', r'\1var ',
                 lines[vardefline])
-          if dd.ty == 'class':
+          if is_assign and dd.ty == 'class' and not is_self:
             # Move the variable (and preceding comments) to the companion object
             if dd.compobj_lineind is None:
               lines[dd.lineind:dd.lineind] = \
@@ -736,6 +779,17 @@ for line in fileinput.input(args):
               adjust_lineinds(len(lines)+1, -prev_blank_or_comment_line_count)
 
             bigline = None
+        if ok_to_var_self and bigline.strip().startswith('val '):
+          # If we've seen a self.* variable assignment, move it outside of the
+          # init statement.
+          bigline = ' '*dd.indent + bigline.lstrip()
+          inslines = bigline.split('\n')
+          inspoint = dd.lineind
+          lines[inspoint:inspoint] = inslines
+          adjust_lineinds(inspoint, len(inslines))
+          if type(curvardict[newvar]) is int:
+            curvardict[newvar] = inspoint
+          bigline = None
 
     break
   if bigline is None:
