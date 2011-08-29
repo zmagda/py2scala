@@ -149,6 +149,14 @@ def teststr(x):
 triple_quote_delims = ['"""', "'''"]
 single_quote_delims = ['"', "'"]
 
+# If we added a triple-quote delimiter, remove it
+def line_no_added_delim(line, delim):
+  if delim:
+    assert line[0:3] == delim
+    return line[3:]
+  else:
+    return line
+
 # Main function to frob the inside of a line.  Passed a line split by
 # stringre.split() into alternating text and delimiters composed of
 # quoted strings and/or comments.  This is a generator function that
@@ -161,7 +169,13 @@ def modline(split):
     vv = split[i]
     #debprint("Saw #%d: %s", i, vv)
     if len(vv) == 0:
+      yield vv
       continue
+
+    # If we're handling a string composed from the added delimiter,
+    # don't try to frob it.
+    nofrob = old_openquote and i == 1 and prev == ""
+
     if i % 2 == 1:
       # We are looking at a delimiter
 
@@ -178,13 +192,15 @@ def modline(split):
         # Look for (unclosed) triple quote
         triplequote = False
         unclosed = False
+        global openquote
         for delim in triple_quote_delims:
           if vv2.startswith(delim):
             triplequote = True
-            if not vv2.endswith(delim):
-              global openquote
+            if vv2 == delim or not vv2.endswith(delim):
               openquote = delim
               unclosed = True
+        if not unclosed:
+          openquote = None
         if triplequote:
           # FIXME!! Python has eight types of strings: Single and triple
           # quoted strings, using both single and double quotes (i.e.
@@ -204,7 +220,7 @@ def modline(split):
           # we can't distinguish "f" as a Scala single-character string
           # (should be left alone) from "f" as a Python single-character
           # string (potentially convertible to Scala 'f').
-          if vv2.startswith("'''"):
+          if vv2.startswith("'''") and not nofrob:
             if unclosed:
               yield raw + '"""' + vv2[3:]
             else:
@@ -214,7 +230,7 @@ def modline(split):
           continue
         for delim in single_quote_delims:
           if (vv2.startswith(delim) and
-              (len(vv2) == 1 or not vv2.endswith(delim))):
+              (vv2 == delim or not vv2.endswith(delim))):
             warning("Saw unfinished single quoted string %s" % vv)
             yield vv
             continue
@@ -286,7 +302,7 @@ def modline(split):
 
 curindent = 0
 contline = None
-# Unclosed multi-line quote to check for (''' or """)
+# Unclosed multi-line quote from previous line (''' or """)
 openquote = None
 # Mismatch in parens so far
 paren_mismatch = 0
@@ -294,6 +310,8 @@ paren_mismatch = 0
 zero_mismatch_indent = 0
 # Line # last time paren mismatch was zero
 zero_mismatch_lineno = 0
+# Accumulation of line across paren mismatches
+bigline = ""
 # List of tuples (LINE#, INDENT, TYPE) of indentation of blocks
 # (if, for, else, ...), where TYPE is "python" or "scala"
 indents = []
@@ -333,40 +351,31 @@ for line in fileinput.input(args):
   #debprint("Saw line: %s", line)
   # If previous line was continued, add it to this line
   if contline:
+    # This is OK because we checked to make sure continuation was not in
+    # a quote or comment
     line = contline.rstrip() + " " + line.lstrip()
     contline = None
                                   
+  # If we are continuing a multiline quote, add the delimiter to the
+  # beginning.  That way we will parse the line correctly.  We remove
+  # the delimiter at the bottom.
+  if openquote:
+    line = openquote + line
+  # Split the line based on quoted and commented sections
+  splitline = list(stringre.split(line))
+
   # If line is continued, don't do anything yet (till we get the whole line)
-  if line and line[-1] == '\\':
-    contline = line[0:-1]
+  lasttext = splitline[-1]
+  if lasttext and lasttext[-1] == '\\':
+    contline = line_no_added_delim(line, openquote)[0:-1]
     continue
-  # Ignore blank line for purposes of figuring out indentation
-  # NOTE: No need to use \s* in these or other regexps because we call
-  # expandtabs() above to convert tabs to spaces, and rstrip() above to
-  # remove \r and \n
-  if re.match(r'^ *$', line):
-    lines += [line]
-    continue
+
+  blankline = re.match(r'^ *$', line)
 
   # Record original line, and values of paren_mismatch at start of line
   old_paren_mismatch = paren_mismatch
   oldline = line
-
-  # If we are in the middle of a multi-line quote, ignore for purposes of
-  # figuring out indentation; also check for end of quote
-  if openquote:
-    # FIXME: Won't correctly handle start of another multi-line quote on
-    # same line
-    splitvals = line.split(openquote)
-    if len(splitvals) > 1:
-      for split in splitvals[1:]:
-        paren_mismatch += split.count('(') - split.count(')')
-      openquote = None
-    lines += [line]
-    continue
-
-  # Split the line based on quoted and commented sections
-  splitline = stringre.split(line)
+  old_openquote = openquote
 
   # Count # of mismatched parens
   for i in xrange(len(splitline)):
@@ -380,54 +389,55 @@ for line in fileinput.input(args):
     warning("Apparent unmatched right-paren, we might be confused: %s" % line)
     paren_mismatch = 0
 
-  # Get current indentation
-  m = re.match('( *)', line)
-  indent = len(m.group(1))
-  # Also record some values if no paren mismatch at start of line
-  if old_paren_mismatch == 0:
-    zero_mismatch_indent = indent
-    zero_mismatch_lineno = lineno
+  if not old_openquote and not blankline:
+    # Get current indentation
+    m = re.match('( *)', line)
+    indent = len(m.group(1))
+    # Also record some values if no paren mismatch at start of line
+    if old_paren_mismatch == 0:
+      zero_mismatch_indent = indent
+      zero_mismatch_lineno = lineno
 
-  # Handle dedent: End any blocks as appropriate, and add braces
-  if indent < curindent:
-    # Pop off all indentation blocks at or more indented than current
-    # position, and add right braces
-    while indents and indents[-1][1] >= indent:
-      blockline, blockind, blocktype = indents.pop()
-      # Can happen, e.g., if // is used in Python to mean "integer division",
-      # or other circumstances where we got confused
-      if old_paren_mismatch > 0:
-        warning("Apparent unmatched left-paren somewhere before, possibly line %d, we might be confused" % zero_mismatch_lineno)
-        # Reset to only mismatched left parens on this line
-        paren_mismatch = paren_mismatch - old_paren_mismatch
-        if paren_mismatch < 0:
-          paren_mismatch = 0
-      if blocktype == "scala":
-        continue
-      rbrace = "%s}" % (' '*blockind)
-      # Check for right brace already present; if so, just make sure
-      # corresponding left brace is present
-      if line.startswith(rbrace):
-        lines[blockline] += " {"
-      else:
-        insertpos = len(lines)
-        # Insert the right brace *before* any blank lines (we skipped over
-        # them since they don't affect indentation)
-        while re.match('^ *$', lines[insertpos - 1]):
-          insertpos -= 1
-        # If the "block" is only a single line, and it's not introduced
-        # by "def" or "class", don't add braces.
-        # We check for 2 because with a single-line block, the potential
-        # right-brace insertion point is 2 lines past the opening block
-        # (1 for opening line itself, 1 for block)
-        if (insertpos - blockline > 2 or
-            re.match('^ *(def|class) ', lines[blockline])):
+    # Handle dedent: End any blocks as appropriate, and add braces
+    if indent < curindent:
+      # Pop off all indentation blocks at or more indented than current
+      # position, and add right braces
+      while indents and indents[-1][1] >= indent:
+        blockline, blockind, blocktype = indents.pop()
+        # Can happen, e.g., if // is used in Python to mean "integer division",
+        # or other circumstances where we got confused
+        if old_paren_mismatch > 0:
+          warning("Apparent unmatched left-paren somewhere before, possibly line %d, we might be confused" % zero_mismatch_lineno)
+          # Reset to only mismatched left parens on this line
+          paren_mismatch = paren_mismatch - old_paren_mismatch
+          if paren_mismatch < 0:
+            paren_mismatch = 0
+        if blocktype == "scala":
+          continue
+        rbrace = "%s}" % (' '*blockind)
+        # Check for right brace already present; if so, just make sure
+        # corresponding left brace is present
+        if line.startswith(rbrace):
           lines[blockline] += " {"
-          lines[insertpos:insertpos] = [rbrace]
-    # Pop off all function definitions that have been closed
-    while defs and defs[-1].indent >= indent:
-      defs.pop()
-  curindent = indent
+        else:
+          insertpos = len(lines)
+          # Insert the right brace *before* any blank lines (we skipped over
+          # them since they don't affect indentation)
+          while re.match('^ *$', lines[insertpos - 1]):
+            insertpos -= 1
+          # If the "block" is only a single line, and it's not introduced
+          # by "def" or "class", don't add braces.
+          # We check for 2 because with a single-line block, the potential
+          # right-brace insertion point is 2 lines past the opening block
+          # (1 for opening line itself, 1 for block)
+          if (insertpos - blockline > 2 or
+              re.match('^ *(def|class) ', lines[blockline])):
+            lines[blockline] += " {"
+            lines[insertpos:insertpos] = [rbrace]
+      # Pop off all function definitions that have been closed
+      while defs and defs[-1].indent >= indent:
+        defs.pop()
+    curindent = indent
 
   ########## Now we modify the line itself
 
@@ -445,6 +455,13 @@ for line in fileinput.input(args):
   # Frob the line in various ways (e.g. change 'and' to '&&')
   line = ''.join(modline(splitline))
 
+  # Accumulate a line across unmatched parens and quotes
+  line_without_delim = line_no_added_delim(line, old_openquote)
+  if old_paren_mismatch == 0 and not old_openquote:
+    bigline = line_without_delim
+  else:
+    bigline = bigline + "\n" + line_without_delim
+
   # Handle blocks.  We only want to check once per line, and Python
   # unfortunately makes it rather awkward to do convenient if-then checks
   # with regexps because there's no equivalent of
@@ -460,9 +477,11 @@ for line in fileinput.input(args):
   # This almost directly mirrors the architecture of a C switch() statement.
   #
 
-  # If we see a Scala-style indent, just note it; important for unmatched-
-  # paren handling above.
-  if paren_mismatch == 0 and re.match(r'.*\{ *$', line):
+  # If we see a Scala-style opening block, just note it; important for
+  # unmatched-paren handling above (in particular where we reset the
+  # unmatched-paren count at the beginning of a block, to deal with
+  # errors in parsing)
+  if paren_mismatch == 0 and not openquote and re.match(r'.*\{ *$', splitline[-1]):
     indents += [(len(lines), zero_mismatch_indent, "scala")]
   front, body, back = "", "", ""
   frontbody = line
@@ -483,12 +502,13 @@ for line in fileinput.input(args):
   # Check for def/class and note function arguments.  We do this separately
   # from the def check below so we find both def and class, and both
   # Scala and Python style.
-  m = re.match(' *(def|class) +(.*?)\((.*)\) *(: *$|=? *\{ *$|extends .*|with .*| *$)', line)
+  m = re.match(' *(def|class) +(.*?)(?:\((.*)\))? *(: *$|=? *\{ *$|extends .*|with .*| *$)', line)
   if m:
-    allargs = m.group(3).strip()
+    (ty, name, allargs, coda) = m.groups()
     argdict = {}
-    if allargs:
-      args = allargs.split(',')
+    python_style_class = ty == 'class' and coda and coda[0] == ':'
+    if not python_style_class and allargs and allargs.strip():
+      args = allargs.strip().split(',')
       # Strip off default assignments
       args = [x.strip().split('=')[0].strip() for x in args]
       # Strip off Scala types
@@ -500,7 +520,7 @@ for line in fileinput.input(args):
           argdict[arg[4:].strip()] = "val"
         else:
           argdict[arg] = "val"
-    defs += [Define(m.group(1), m.group(2), argdict)]
+    defs += [Define(ty, name, argdict)]
     #debprint("Adding args %s for function", argdict)
 
   newblock = None
@@ -581,13 +601,14 @@ for line in fileinput.input(args):
     # use of a named param looks like a variable assignment).
     #debprint("About to check for vars, line %d, old paren mismatch %d",
     #    lineno, old_paren_mismatch)
-    if defs and old_paren_mismatch == 0:
+    if defs and defs[-1].ty == 'def' and old_paren_mismatch == 0:
       curvardict = defs[-1].vardict
       # Make sure we see a variable assignment in both the unfrobbed and
       # frobbed lines, so that we ignore cases where we removed a `self.'.
-      m = re.match('( *)(val |var |)([a-zA-Z_][a-zA-Z_0-9]*)( *=)(.*)', oldline)
+      assignre = re.compile('( *)(val |var |)([a-zA-Z_][a-zA-Z_0-9]*)( *=)(.*)')
+      m = assignre.match(oldline)
       if m:
-        m = re.match('( *)(val |var |)([a-zA-Z_][a-zA-Z_0-9]*)( *=)(.*)', line)
+        m = assignre.match(line)
       if m:
         newvar = m.group(3)
         if m.group(2):
@@ -612,10 +633,15 @@ for line in fileinput.input(args):
         break
     break
   if newblock:
-    indents += [(len(lines), indent, "python")]
+    indents += [(len(lines), curindent, "python")]
     lines += [front + newblock + back]
   else:
-    lines += [line]
+    lines += [line_no_added_delim(line, old_openquote)]
 
 for line in lines:
   print line
+
+# Ignore blank line for purposes of figuring out indentation
+# NOTE: No need to use \s* in these or other regexps because we call
+# expandtabs() above to convert tabs to spaces, and rstrip() above to
+# remove \r and \n
