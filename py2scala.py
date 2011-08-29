@@ -472,9 +472,9 @@ for line in fileinput.input(args):
           # We check for 2 because with a single-line block, the potential
           # right-brace insertion point is 2 lines past the opening block
           # (1 for opening line itself, 1 for block)
-          debprint("lineno:%s, startind:%s, endind:%s, lines:%s",
-              lineno, indobj.startind,
-              indobj.endind, len(lines))
+          #debprint("lineno:%s, startind:%s, endind:%s, lines:%s",
+          #    lineno, indobj.startind,
+          #    indobj.endind, len(lines))
           if (insertpos - indobj.endind > 2 or
               re.match('^ *(def|class) ', lines[indobj.startind])):
             lines[indobj.endind] += " {"
@@ -486,7 +486,7 @@ for line in fileinput.input(args):
 
   # Record some values if no paren mismatch at start of line
   if not old_openquote and old_paren_mismatch == 0:
-    zero_mismatch_indent = indent
+    zero_mismatch_indent = curindent
     zero_mismatch_lineno = lineno
 
   ########## Now we modify the line itself
@@ -711,30 +711,31 @@ for line in fileinput.input(args):
             elif type(vardefline) is int:
               lines[vardefline] = re.sub(r'^( *)val ', r'\1var ',
                 lines[vardefline])
-        if dd.ty == 'class':
-          # Move the variable (and preceding comments) to the companion object
-          if dd.compobj_lineind is None:
-            lines[dd.lineind:dd.lineind] = \
-                ['%sobject %s {' % (' '*dd.indent, dd.name),
-                 '%s}' % (' '*dd.indent),
-                 '']
-            # This should adjust dd.lineind up by 3!
-            old_lineind = dd.lineind
-            adjust_lineinds(dd.lineind, 3)
-            assert dd.lineind == old_lineind + 3
-            dd.compobj_lineind = dd.lineind - 2
-          inslines = bigline.split('\n')
-          inspoint = dd.compobj_lineind
-          lines[inspoint:inspoint] = inslines
-          adjust_lineinds(inspoint, len(inslines))
-          curvardict[newvar] = inspoint
-          if prev_blank_or_comment_line_count > 0:
-            lines[inspoint:inspoint] = lines[-prev_blank_or_comment_line_count:]
-            adjust_lineinds(inspoint, prev_blank_or_comment_line_count)
-            del lines[-prev_blank_or_comment_line_count:]
-            adjust_lineinds(len(lines)+1, -prev_blank_or_comment_line_count)
+          if dd.ty == 'class':
+            # Move the variable (and preceding comments) to the companion object
+            if dd.compobj_lineind is None:
+              lines[dd.lineind:dd.lineind] = \
+                  ['%sobject %s {' % (' '*dd.indent, dd.name),
+                   '%s}' % (' '*dd.indent),
+                   '']
+              # This should adjust dd.lineind up by 3!
+              old_lineind = dd.lineind
+              adjust_lineinds(dd.lineind, 3)
+              assert dd.lineind == old_lineind + 3
+              dd.compobj_lineind = dd.lineind - 2
+            inslines = bigline.split('\n')
+            inspoint = dd.compobj_lineind
+            lines[inspoint:inspoint] = inslines
+            adjust_lineinds(inspoint, len(inslines))
+            curvardict[newvar] = inspoint
+            if prev_blank_or_comment_line_count > 0:
+              lines[inspoint:inspoint] = (
+                  lines[-prev_blank_or_comment_line_count:])
+              adjust_lineinds(inspoint, prev_blank_or_comment_line_count)
+              del lines[-prev_blank_or_comment_line_count:]
+              adjust_lineinds(len(lines)+1, -prev_blank_or_comment_line_count)
 
-          bigline = None
+            bigline = None
 
     break
   if bigline is None:
