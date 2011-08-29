@@ -301,18 +301,22 @@ indents = []
 lineno = 0
 # Lines accumulated so far.  We need to be able to go back and modify old
 # lines sometimes.  Note that len(lines) is the "line index" of the
-# current line being processed, at least after we 
+# current line being processed, at least after we handle dedentation
+# (where we might be inserting lines).
 lines = []
 
 class Define:
     # ty: "class" or "def"
     # name: name of class or def
-    # argdict: dict of currently active params and local vars
-    def __init__(self, ty, name, argdict):
+    # vardict: dict of currently active params and local vars
+    def __init__(self, ty, name, vardict):
       self.ty = ty
       self.name = name
       self.indent = indent
-      self.argdict = argdict
+      self.vardict = vardict
+      self.lineno = lineno
+      self.lineind = len(lines)
+      self.indent = curindent
 
 # List, for each currently active function and class define, of Define objects
 # (not yet ...  still tuples)
@@ -421,7 +425,7 @@ for line in fileinput.input(args):
           lines[blockline] += " {"
           lines[insertpos:insertpos] = [rbrace]
     # Pop off all function definitions that have been closed
-    while defs and defs[-1][0] >= indent:
+    while defs and defs[-1].indent >= indent:
       defs.pop()
   curindent = indent
 
@@ -479,9 +483,9 @@ for line in fileinput.input(args):
   # Check for def/class and note function arguments.  We do this separately
   # from the def check below so we find both def and class, and both
   # Scala and Python style.
-  m = re.match(' *(?:def|class) +(.*?)\((.*)\) *(: *$|=? *\{ *$|extends .*|with .*| *$)', line)
+  m = re.match(' *(def|class) +(.*?)\((.*)\) *(: *$|=? *\{ *$|extends .*|with .*| *$)', line)
   if m:
-    allargs = m.group(2).strip()
+    allargs = m.group(3).strip()
     argdict = {}
     if allargs:
       args = allargs.split(',')
@@ -496,7 +500,7 @@ for line in fileinput.input(args):
           argdict[arg[4:].strip()] = "val"
         else:
           argdict[arg] = "val"
-    defs += [(indent, argdict)]
+    defs += [Define(m.group(1), m.group(2), argdict)]
     #debprint("Adding args %s for function", argdict)
 
   newblock = None
@@ -578,7 +582,7 @@ for line in fileinput.input(args):
     #debprint("About to check for vars, line %d, old paren mismatch %d",
     #    lineno, old_paren_mismatch)
     if defs and old_paren_mismatch == 0:
-      curvardict = defs[-1][1]
+      curvardict = defs[-1].vardict
       # Make sure we see a variable assignment in both the unfrobbed and
       # frobbed lines, so that we ignore cases where we removed a `self.'.
       m = re.match('( *)(val |var |)([a-zA-Z_][a-zA-Z_0-9]*)( *=)(.*)', oldline)
