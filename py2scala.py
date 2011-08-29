@@ -157,6 +157,12 @@ def line_no_added_delim(line, delim):
   else:
     return line
 
+# Add a "virtual line", possibly spanning multiple lines, to the line list
+def add_bigline(bigline):
+  global lines
+  if bigline is not None:
+    lines += bigline.split('\n')
+
 # Main function to frob the inside of a line.  Passed a line split by
 # stringre.split() into alternating text and delimiters composed of
 # quoted strings and/or comments.  This is a generator function that
@@ -310,11 +316,15 @@ paren_mismatch = 0
 zero_mismatch_indent = 0
 # Line # last time paren mismatch was zero
 zero_mismatch_lineno = 0
+# Line index last time paren mismatch was zero
+zero_mismatch_lineind = 0
 # Accumulation of line across paren mismatches
-bigline = ""
-# List of tuples (LINE#, INDENT, TYPE) of indentation of blocks
-# (if, for, else, ...), where TYPE is "python" or "scala"
-indents = []
+bigline = None
+# Accumulation of unfrobbed line across paren mismatches
+old_bigline = None
+# Lineno and indent at start of bigline
+bigline_indent = 0
+bigline_lineno = 0
 # Current line number
 lineno = 0
 # Lines accumulated so far.  We need to be able to go back and modify old
@@ -323,21 +333,32 @@ lineno = 0
 # (where we might be inserting lines).
 lines = []
 
-class Define:
-    # ty: "class" or "def"
-    # name: name of class or def
-    # vardict: dict of currently active params and local vars
-    def __init__(self, ty, name, vardict):
-      self.ty = ty
-      self.name = name
-      self.indent = indent
-      self.vardict = vardict
-      self.lineno = lineno
-      self.lineind = len(lines)
-      self.indent = curindent
+class Indent:
+  # startind: Line index of beginning of block-begin statement
+  # endind: Line index of end of block-begin statement
+  # indent: Indentation of block-begin statement
+  # ty: "python" or "scala"
+  def __init__(self, startind, endind, indent, ty):
+    self.startind = startind
+    self.endind = endind
+    self.indent = indent
+    self.ty = ty
 
+class Define:
+  # ty: "class" or "def"
+  # name: name of class or def
+  # vardict: dict of currently active params and local vars
+  def __init__(self, ty, name, vardict):
+    self.ty = ty
+    self.name = name
+    self.vardict = vardict
+    self.lineno = bigline_lineno
+    self.indent = bigline_indent
+    self.lineind = len(lines)
+
+# List of currently active indentation blocks, of Indent objects
+indents = []
 # List, for each currently active function and class define, of Define objects
-# (not yet ...  still tuples)
 defs = []
 
 def warning(text, nonl=False):
@@ -393,17 +414,13 @@ for line in fileinput.input(args):
     # Get current indentation
     m = re.match('( *)', line)
     indent = len(m.group(1))
-    # Also record some values if no paren mismatch at start of line
-    if old_paren_mismatch == 0:
-      zero_mismatch_indent = indent
-      zero_mismatch_lineno = lineno
 
     # Handle dedent: End any blocks as appropriate, and add braces
     if indent < curindent:
       # Pop off all indentation blocks at or more indented than current
       # position, and add right braces
-      while indents and indents[-1][1] >= indent:
-        blockline, blockind, blocktype = indents.pop()
+      while indents and indents[-1].indent >= indent:
+        indobj = indents.pop()
         # Can happen, e.g., if // is used in Python to mean "integer division",
         # or other circumstances where we got confused
         if old_paren_mismatch > 0:
@@ -412,13 +429,13 @@ for line in fileinput.input(args):
           paren_mismatch = paren_mismatch - old_paren_mismatch
           if paren_mismatch < 0:
             paren_mismatch = 0
-        if blocktype == "scala":
+        if indobj.ty == "scala":
           continue
-        rbrace = "%s}" % (' '*blockind)
+        rbrace = "%s}" % (' '*indobj.indent)
         # Check for right brace already present; if so, just make sure
         # corresponding left brace is present
         if line.startswith(rbrace):
-          lines[blockline] += " {"
+          lines[indobj.endind] += " {"
         else:
           insertpos = len(lines)
           # Insert the right brace *before* any blank lines (we skipped over
@@ -430,14 +447,20 @@ for line in fileinput.input(args):
           # We check for 2 because with a single-line block, the potential
           # right-brace insertion point is 2 lines past the opening block
           # (1 for opening line itself, 1 for block)
-          if (insertpos - blockline > 2 or
-              re.match('^ *(def|class) ', lines[blockline])):
-            lines[blockline] += " {"
+          if (insertpos - indobj.endind > 2 or
+              re.match('^ *(def|class) ', lines[indobj.startind])):
+            lines[indobj.endind] += " {"
             lines[insertpos:insertpos] = [rbrace]
       # Pop off all function definitions that have been closed
       while defs and defs[-1].indent >= indent:
         defs.pop()
     curindent = indent
+
+  # Record some values if no paren mismatch at start of line
+  if not old_openquote and old_paren_mismatch == 0:
+    zero_mismatch_indent = indent
+    zero_mismatch_lineno = lineno
+    zero_mismatch_lineind = len(lines)
 
   ########## Now we modify the line itself
 
@@ -457,10 +480,18 @@ for line in fileinput.input(args):
 
   # Accumulate a line across unmatched parens and quotes
   line_without_delim = line_no_added_delim(line, old_openquote)
+  old_line_without_delim = line_no_added_delim(oldline, old_openquote)
   if old_paren_mismatch == 0 and not old_openquote:
+    assert bigline == None
     bigline = line_without_delim
+    old_bigline = old_line_without_delim
+    bigline_indent = curindent
+    bigline_lineno = lineno
+    assert bigline_indent == zero_mismatch_indent
+    assert bigline_lineno == zero_mismatch_lineno
   else:
     bigline = bigline + "\n" + line_without_delim
+    old_bigline = old_bigline + "\n" + old_line_without_delim
 
   # Handle blocks.  We only want to check once per line, and Python
   # unfortunately makes it rather awkward to do convenient if-then checks
@@ -482,11 +513,31 @@ for line in fileinput.input(args):
   # unmatched-paren count at the beginning of a block, to deal with
   # errors in parsing)
   if paren_mismatch == 0 and not openquote and re.match(r'.*\{ *$', splitline[-1]):
-    indents += [(len(lines), zero_mismatch_indent, "scala")]
+    indents += [Indent(len(lines), len(lines) + (bigline or "").count('\n'),
+      zero_mismatch_indent, "scala")]
+
+  if not old_openquote and old_paren_mismatch > 0 and \
+      re.match(r' *(if|for|with|while|try|elif|else|except|def|class) +.*:.*$',
+               line):
+    # Can happen, e.g., if // is used in Python to mean "integer division",
+    # or other circumstances where we got confused
+    warning("Apparent unmatched left-paren somewhere before, possibly line %d, we might be confused" % zero_mismatch_lineno)
+    # Reset to only mismatched left parens on this line
+    paren_mismatch = paren_mismatch - old_paren_mismatch
+    if paren_mismatch < 0:
+      paren_mismatch = 0
+    add_bigline(bigline)
+    bigline = line
+    old_bigline = oldline
+
+  # Skip to next line if this line doesn't really end
+  if paren_mismatch > 0 or openquote:
+    continue
+
   front, body, back = "", "", ""
-  frontbody = line
+  frontbody = bigline
   # Look for a statement introducing a body
-  m = re.match(r'( *)(.*?) *: *$', frontbody)
+  m = re.match(r'(\s*)(.*?)\s*:\s*$', frontbody, re.S)
   if m:
     front, body = m.groups()
   else:
@@ -494,7 +545,7 @@ for line in fileinput.input(args):
     if len(splits) == 3:
       frontbody = splits[0]
       newback = splits[1] + splits[2]
-      m = re.match(r'''( *)([^\'\"]*?) *: *$''', frontbody)
+      m = re.match(r'''(\s*)([^\'\"]*?)\s*:\s*$''', frontbody, re.S)
       if m:
         front, body = m.groups()
         back = " " + newback
@@ -502,7 +553,7 @@ for line in fileinput.input(args):
   # Check for def/class and note function arguments.  We do this separately
   # from the def check below so we find both def and class, and both
   # Scala and Python style.
-  m = re.match(' *(def|class) +(.*?)(?:\((.*)\))? *(: *$|=? *\{ *$|extends .*|with .*| *$)', line)
+  m = re.match('\s*(def|class)\s+(.*?)(?:\((.*)\))?\s*(:\s*$|=?\s*\{ *$|extends\s.*|with\s.*|\s*$)', bigline, re.S)
   if m:
     (ty, name, allargs, coda) = m.groups()
     argdict = {}
@@ -527,70 +578,70 @@ for line in fileinput.input(args):
   while True:
     if body:
       # Check for def
-      m = re.match('def +(.*?)\((.*)\)$', body)
+      m = re.match('def\s+(.*?)\((.*)\)$', body, re.S)
       if m:
         newblock = "def %s(%s)" % m.groups()
         break
       # Check for 'for' statement
-      m = re.match('for +(.*?) +in +(.*)$', body)
+      m = re.match('for\s+(.*?)\s+in\s+(.*)$', body, re.S)
       if m:
         newblock = "for (%s <- %s)" % m.groups()
         break
       # Check for 'if' statement
-      m = re.match('if +(.*)$', body)
+      m = re.match('if\s+(.*)$', body, re.S)
       if m:
         newblock = "if (%s)" % m.groups()
         break
       # Check for 'elif' statement
-      m = re.match('elif +(.*)$', body)
+      m = re.match('elif\s+(.*)$', body, re.S)
       if m:
         newblock = "else if (%s)" % m.groups()
         break
       # Check for 'else' statement
-      m = re.match('else *$', body)
+      m = re.match('else\s*$', body, re.S)
       if m:
         newblock = "else"
         break
       # Check for 'while' statement
-      m = re.match('while (.*)$', body)
+      m = re.match('while\s(.*)$', body, re.S)
       if m:
         newblock = "while (%s)" % m.groups()
         break
       # Check for 'try' statement
-      m = re.match('try *$', body)
+      m = re.match('try\s*$', body, re.S)
       if m:
         newblock = "try"
         break
       # Check for bare 'except' statement
-      m = re.match('except *$', body)
+      m = re.match('except\s*$', body, re.S)
       if m:
         newblock = "catch"
         break
       # Check for 'except' statement
       # FIXME: Should convert to a case statement within the body
-      m = re.match('except (.*)$', body)
+      m = re.match('except\s+(.*)$', body, re.S)
       if m:
         newblock = "catch %s" % m.groups()
         break
       # Check for 'finally' statement
-      m = re.match('finally *$', body)
+      m = re.match('finally\s*$', body, re.S)
       if m:
         newblock = "finally"
         break
       # Check for 'class(object)' statement
       # Class that inherits from `object' (new-style class), convert to
       # class without superclass
-      m = re.match('class (.*)\(object\)', body)
+      m = re.match('class\s+(.*)\(object\)', body, re.S)
       if m:
         newblock = "class %s" % m.groups()
         break
       # Check for 'class(superclass)' statement
-      m = re.match('class (.*)\((.*)\)$', body)
+      m = re.match('class\s+(.*)\((.*)\)$', body, re.S)
       if m:
         newblock = "class %s extends %s" % m.groups()
         break
       # Check for 'class' statement (no superclass)
-      m = re.match('class ([^(]*)$', body)
+      m = re.match('class\s+([^(]*)$', body, re.S)
       if m:
         newblock = "class %s" % m.groups()
         break
@@ -599,17 +650,19 @@ for line in fileinput.input(args):
     # variable, and we previously added a val, change it to var.  Don't
     # do this if we're inside of a function call or similar (where the
     # use of a named param looks like a variable assignment).
-    #debprint("About to check for vars, line %d, old paren mismatch %d",
-    #    lineno, old_paren_mismatch)
-    if defs and defs[-1].ty == 'def' and old_paren_mismatch == 0:
+    debprint("About to check for vars, line %d, fun %s",
+        lineno, defs and defs[-1].name)
+    if defs and defs[-1].ty == 'def' and paren_mismatch == 0:
+      debprint("Checking for vars, line %d, old_bigline[%s], bigline[%s]", lineno, old_bigline, bigline)
       curvardict = defs[-1].vardict
       # Make sure we see a variable assignment in both the unfrobbed and
       # frobbed lines, so that we ignore cases where we removed a `self.'.
-      assignre = re.compile('( *)(val |var |)([a-zA-Z_][a-zA-Z_0-9]*)( *=)(.*)')
-      m = assignre.match(oldline)
+      assignre = re.compile('(\s*)(val\s+|var\s+|)([a-zA-Z_][a-zA-Z_0-9]*)(\s*=)(.*)', re.S)
+      m = assignre.match(old_bigline)
       if m:
-        m = assignre.match(line)
+        m = assignre.match(bigline)
       if m:
+        debprint("Saw var")
         newvar = m.group(3)
         if m.group(2):
           # Already seen val/var decl
@@ -622,7 +675,7 @@ for line in fileinput.input(args):
           #debprint("newvar: %s, curvardict: %s", newvar, curvardict)
           if newvar not in curvardict:
             curvardict[newvar] = len(lines)
-            line = "%sval %s%s%s%s" % m.groups()
+            bigline = "%sval %s%s%s%s" % m.groups()
           else:
             vardefline = curvardict[newvar]
             if vardefline == "val":
@@ -633,10 +686,12 @@ for line in fileinput.input(args):
         break
     break
   if newblock:
-    indents += [(len(lines), curindent, "python")]
-    lines += [front + newblock + back]
+    startind = len(lines)
+    add_bigline(front + newblock + back)
+    indents += [Indent(startind, len(lines)-1, bigline_indent, "python")]
   else:
-    lines += [line_no_added_delim(line, old_openquote)]
+    add_bigline(bigline)
+  bigline = None
 
 for line in lines:
   print line
