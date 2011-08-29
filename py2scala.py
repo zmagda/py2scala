@@ -120,8 +120,6 @@ def debprint(fmt, *vals):
   if debug:
     errprint("Debug: %s" % (fmt % vals))
 
-lines = []
-
 balparenexpr = r'\([^()]*\)'
 balbracketexpr = r'\[[^\[\]]*\]'
 balstr0 = r'(?:[^()\[\]]|%s|%s)*' % (balparenexpr, balbracketexpr)
@@ -150,8 +148,11 @@ def teststr(x):
 
 triple_quote_delims = ['"""', "'''"]
 single_quote_delims = ['"', "'"]
-# Main function to frob the inside of a line.  Written as a generator
-# function using `yield'.
+
+# Main function to frob the inside of a line.  Passed a line split by
+# stringre.split() into alternating text and delimiters composed of
+# quoted strings and/or comments.  This is a generator function that
+# returns values with `yield'.
 def modline(split):
   for i in xrange(len(split)):
     prev = None
@@ -244,9 +245,6 @@ def modline(split):
     else:
       # Not a delimiter
 
-      global paren_mismatch
-      paren_mismatch += vv.count('(') - vv.count(')')
-
       vv = re.sub(r'\bor\b', '||', vv)
       vv = re.sub(r'\band\b', '&&', vv)
       vv = re.sub(r'\bTrue\b', 'true', vv)
@@ -257,7 +255,7 @@ def modline(split):
       vv = re.sub(r'\bnot ', '!', vv)
       vv = re.sub(r'\bis (None|null)\b', '== null', vv)
       vv = re.sub(r'\bis !.*(None|null)\b', '!= null', vv)
-      vv = re.sub(r'lambda ([A-Za-z0-9]+):', r'\1 =>', vv)
+      vv = re.sub(r'lambda ([A-Za-z0-9]+): ?', r'\1 => ', vv)
       # Seems this isn't necessary; (for x <- y if foo) works fine in Scala
       #vv = re.sub(r'[\[(](.*) for (.*) in (.*) if (.*)[)\]]',
       #             r'(for (\2 <- \3; if \4) yield \1)', vv)
@@ -299,11 +297,26 @@ zero_mismatch_lineno = 0
 # List of tuples (LINE#, INDENT, TYPE) of indentation of blocks
 # (if, for, else, ...), where TYPE is "python" or "scala"
 indents = []
-# For each currently active function define, list of tuples of indent level
-# and list of currently active params and local vars
-defs = []
 # Current line number
 lineno = 0
+# Lines accumulated so far.  We need to be able to go back and modify old
+# lines sometimes.  Note that len(lines) is the "line index" of the
+# current line being processed, at least after we 
+lines = []
+
+class Define:
+    # ty: "class" or "def"
+    # name: name of class or def
+    # argdict: dict of currently active params and local vars
+    def __init__(self, ty, name, argdict):
+      self.ty = ty
+      self.name = name
+      self.indent = indent
+      self.argdict = argdict
+
+# List, for each currently active function and class define, of Define objects
+# (not yet ...  still tuples)
+defs = []
 
 def warning(text, nonl=False):
   '''Line errprint() but also add "Warning: " and line# to the beginning.'''
@@ -311,7 +324,6 @@ def warning(text, nonl=False):
 
 for line in fileinput.input(args):
   lineno += 1
-  newblock = None
 
   line = line.rstrip("\r\n").expandtabs()
   #debprint("Saw line: %s", line)
@@ -320,9 +332,6 @@ for line in fileinput.input(args):
     line = contline.rstrip() + " " + line.lstrip()
     contline = None
                                   
-  old_paren_mismatch = paren_mismatch
-  oldline = line
-
   # If line is continued, don't do anything yet (till we get the whole line)
   if line and line[-1] == '\\':
     contline = line[0:-1]
@@ -334,6 +343,11 @@ for line in fileinput.input(args):
   if re.match(r'^ *$', line):
     lines += [line]
     continue
+
+  # Record original line, and values of paren_mismatch at start of line
+  old_paren_mismatch = paren_mismatch
+  oldline = line
+
   # If we are in the middle of a multi-line quote, ignore for purposes of
   # figuring out indentation; also check for end of quote
   if openquote:
@@ -347,19 +361,15 @@ for line in fileinput.input(args):
     lines += [line]
     continue
 
-  if options.remove_self:
-    m = re.match(r'^( *def +[A-Za-z0-9_]+)\((?:self|cls)(\)|, *)(.*)$', line)
-    if m:
-      if m.group(2) == ')':
-        line = '%s()%s' % (m.group(1), m.group(3))
-      else:
-        line = '%s(%s' % (m.group(1), m.group(3))
-    if re.match(r'^ *def +__init__\(', line):
-      warning("Need to convert to Scala constructor: %s" % line)
+  # Split the line based on quoted and commented sections
+  splitline = stringre.split(line)
 
-  #line = ''.join(modline([line]))
-  line = ''.join(modline(stringre.split(line)))
-
+  # Count # of mismatched parens
+  for i in xrange(len(splitline)):
+    vv = splitline[i]
+    if i % 2 == 0:
+      # Not a delimiter
+      paren_mismatch += vv.count('(') - vv.count(')')
   #debprint("Line %d, old paren mismatch %d, new paren mismatch %d",
   #    lineno, old_paren_mismatch, paren_mismatch)
   if paren_mismatch < 0:
@@ -369,9 +379,12 @@ for line in fileinput.input(args):
   # Get current indentation
   m = re.match('( *)', line)
   indent = len(m.group(1))
+  # Also record some values if no paren mismatch at start of line
   if old_paren_mismatch == 0:
     zero_mismatch_indent = indent
     zero_mismatch_lineno = lineno
+
+  # Handle dedent: End any blocks as appropriate, and add braces
   if indent < curindent:
     # Pop off all indentation blocks at or more indented than current
     # position, and add right braces
@@ -411,6 +424,22 @@ for line in fileinput.input(args):
     while defs and defs[-1][0] >= indent:
       defs.pop()
   curindent = indent
+
+  ########## Now we modify the line itself
+
+  # Remove self and cls parameters from def(), if called for
+  if options.remove_self:
+    m = re.match(r'^( *def +[A-Za-z0-9_]+)\((?:self|cls)(\)|, *)(.*)$', line)
+    if m:
+      if m.group(2) == ')':
+        line = '%s()%s' % (m.group(1), m.group(3))
+      else:
+        line = '%s(%s' % (m.group(1), m.group(3))
+    if re.match(r'^ *def +__init__\(', line):
+      warning("Need to convert to Scala constructor: %s" % line)
+
+  # Frob the line in various ways (e.g. change 'and' to '&&')
+  line = ''.join(modline(splitline))
 
   # Handle blocks.  We only want to check once per line, and Python
   # unfortunately makes it rather awkward to do convenient if-then checks
@@ -470,6 +499,7 @@ for line in fileinput.input(args):
     defs += [(indent, argdict)]
     #debprint("Adding args %s for function", argdict)
 
+  newblock = None
   while True:
     if body:
       # Check for def
