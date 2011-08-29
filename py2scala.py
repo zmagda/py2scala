@@ -316,8 +316,6 @@ paren_mismatch = 0
 zero_mismatch_indent = 0
 # Line # last time paren mismatch was zero
 zero_mismatch_lineno = 0
-# Line index last time paren mismatch was zero
-zero_mismatch_lineind = 0
 # Accumulation of line across paren mismatches
 bigline = None
 # Accumulation of unfrobbed line across paren mismatches
@@ -332,6 +330,9 @@ lineno = 0
 # current line being processed, at least after we handle dedentation
 # (where we might be inserting lines).
 lines = []
+# Number of blank or comment-only lines just seen
+blank_or_comment_line_count = 0
+prev_blank_or_comment_line_count = 0
 
 class Indent:
   # startind: Line index of beginning of block-begin statement
@@ -344,6 +345,10 @@ class Indent:
     self.indent = indent
     self.ty = ty
 
+  def adjust_lineinds(self, at, by):
+    if self.startind >= at: self.startind += by
+    if self.endind >= at: self.endind += by
+
 class Define:
   # ty: "class" or "def"
   # name: name of class or def
@@ -355,11 +360,26 @@ class Define:
     self.lineno = bigline_lineno
     self.indent = bigline_indent
     self.lineind = len(lines)
+    # Line index of insertion point in companion object
+    self.compobj_lineind = None
+
+  def adjust_lineinds(self, at, by):
+    if self.lineind >= at: self.lineind += by
+    if self.compobj_lineind and self.compobj_lineind >= at: self.compobj_lineind += by
+    for (k, v) in self.vardict.iteritems():
+      if type(v) is int and v >= at: self.vardict[k] += v
 
 # List of currently active indentation blocks, of Indent objects
 indents = []
 # List, for each currently active function and class define, of Define objects
 defs = []
+
+# Adjust line indices starting at AT up by BY.
+def adjust_lineinds(at, by):
+  for d in defs:
+    d.adjust_lineinds(at, by)
+  for i in indents:
+    i.adjust_lineinds(at, by)
 
 def warning(text, nonl=False):
   '''Line errprint() but also add "Warning: " and line# to the beginning.'''
@@ -392,6 +412,11 @@ for line in fileinput.input(args):
     continue
 
   blankline = re.match(r'^ *$', line)
+  if re.match('^ *(#.*|//.*)?$', line):
+    blank_or_comment_line_count += 1
+  else:
+    prev_blank_or_comment_line_count = blank_or_comment_line_count
+    blank_or_comment_line_count = 0
 
   # Record original line, and values of paren_mismatch at start of line
   old_paren_mismatch = paren_mismatch
@@ -447,6 +472,9 @@ for line in fileinput.input(args):
           # We check for 2 because with a single-line block, the potential
           # right-brace insertion point is 2 lines past the opening block
           # (1 for opening line itself, 1 for block)
+          debprint("lineno:%s, startind:%s, endind:%s, lines:%s",
+              lineno, indobj.startind,
+              indobj.endind, len(lines))
           if (insertpos - indobj.endind > 2 or
               re.match('^ *(def|class) ', lines[indobj.startind])):
             lines[indobj.endind] += " {"
@@ -460,7 +488,6 @@ for line in fileinput.input(args):
   if not old_openquote and old_paren_mismatch == 0:
     zero_mismatch_indent = indent
     zero_mismatch_lineno = lineno
-    zero_mismatch_lineind = len(lines)
 
   ########## Now we modify the line itself
 
@@ -650,11 +677,12 @@ for line in fileinput.input(args):
     # variable, and we previously added a val, change it to var.  Don't
     # do this if we're inside of a function call or similar (where the
     # use of a named param looks like a variable assignment).
-    debprint("About to check for vars, line %d, fun %s",
-        lineno, defs and defs[-1].name)
-    if defs and defs[-1].ty == 'def' and paren_mismatch == 0:
-      debprint("Checking for vars, line %d, old_bigline[%s], bigline[%s]", lineno, old_bigline, bigline)
-      curvardict = defs[-1].vardict
+    #debprint("About to check for vars, line %d, fun %s",
+    #    lineno, defs and defs[-1].name)
+    if defs and paren_mismatch == 0:
+      dd = defs[-1]
+      #debprint("Checking for vars, line %d, old_bigline[%s], bigline[%s]", lineno, old_bigline, bigline)
+      curvardict = dd.vardict
       # Make sure we see a variable assignment in both the unfrobbed and
       # frobbed lines, so that we ignore cases where we removed a `self.'.
       assignre = re.compile('(\s*)(val\s+|var\s+|)([a-zA-Z_][a-zA-Z_0-9]*)(\s*=)(.*)', re.S)
@@ -662,7 +690,7 @@ for line in fileinput.input(args):
       if m:
         m = assignre.match(bigline)
       if m:
-        debprint("Saw var")
+        #debprint("Saw var")
         newvar = m.group(3)
         if m.group(2):
           # Already seen val/var decl
@@ -683,8 +711,34 @@ for line in fileinput.input(args):
             elif type(vardefline) is int:
               lines[vardefline] = re.sub(r'^( *)val ', r'\1var ',
                 lines[vardefline])
-        break
+        if dd.ty == 'class':
+          # Move the variable (and preceding comments) to the companion object
+          if dd.compobj_lineind is None:
+            lines[dd.lineind:dd.lineind] = \
+                ['%sobject %s {' % (' '*dd.indent, dd.name),
+                 '%s}' % (' '*dd.indent),
+                 '']
+            # This should adjust dd.lineind up by 3!
+            old_lineind = dd.lineind
+            adjust_lineinds(dd.lineind, 3)
+            assert dd.lineind == old_lineind + 3
+            dd.compobj_lineind = dd.lineind - 2
+          inslines = bigline.split('\n')
+          inspoint = dd.compobj_lineind
+          lines[inspoint:inspoint] = inslines
+          adjust_lineinds(inspoint, len(inslines))
+          curvardict[newvar] = inspoint
+          if prev_blank_or_comment_line_count > 0:
+            lines[inspoint:inspoint] = lines[-prev_blank_or_comment_line_count:]
+            adjust_lineinds(inspoint, prev_blank_or_comment_line_count)
+            del lines[-prev_blank_or_comment_line_count:]
+            adjust_lineinds(len(lines)+1, -prev_blank_or_comment_line_count)
+
+          bigline = None
+
     break
+  if bigline is None:
+    continue
   if newblock:
     startind = len(lines)
     add_bigline(front + newblock + back)
