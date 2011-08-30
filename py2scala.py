@@ -63,11 +63,9 @@ Thus, the program is intended to work as follows:
 3. Run it again with appropriate options to fix up self references and brackets
 
 Currently, parsing is done with regexps rather than context-free.  This means
-that some constructions will not be converted perfectly.  Currently the
-program's handling of strings and one-line comments is rather good, and
-its handling of multiline strings decent, but it doesn't yet properly handle
-if statements and other block openers that stretch across multiple lines.
-(These will be left alone.)
+that some constructions may not be converted perfectly.  However, strings
+of various sorts (including multiline strings) are usually handled properly;
+likewise multiline block openers and such.
 """
 
 parser = optparse.OptionParser(usage=usage)
@@ -87,6 +85,10 @@ type parameters) using the assumption that types in Scala begin with an
 uppercase letter.""")
 
 (options, args) = parser.parse_args()
+
+## FIXME: Converting this program to use a proper parser would make some
+## conversions easier (e.g. $1 in $2 -> $2 contains $1), and might simplify
+## some of the multiline handling.
 
 ## Process file(s)
 
