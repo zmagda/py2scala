@@ -88,8 +88,6 @@ uppercase letter.""")
 
 (options, args) = parser.parse_args()
 
-debug = True
-
 ## Process file(s)
 
 def uniprint(text, outfile=sys.stdout, nonl=False, flush=False):
@@ -116,10 +114,13 @@ without errors.  Uses the 'print' command, and normally outputs a newline; but
 this can be suppressed using NONL.'''
   uniprint(text, outfile=sys.stderr, nonl=nonl)
 
+# A hackish function for print-debugging.
 def debprint(fmt, *vals):
-  if debug:
-    errprint("Debug: %s" % (fmt % vals))
+  errprint("Debug: %s" % (fmt % vals))
 
+# RE's for balanced expressions.  This is a major hack.  We only use this
+# for things like converting '$1 in $2' to '$2 contains $1'.  In general,
+# we count parens and brackets properly.
 balparenexpr = r'\([^()]*\)'
 balbracketexpr = r'\[[^\[\]]*\]'
 balstr0 = r'(?:[^()\[\]]|%s|%s)*' % (balparenexpr, balbracketexpr)
@@ -130,6 +131,10 @@ bal2strnospace0 = r'(?:[^ ()\[\]]|%s|%s)*' % (bal2parenexpr, bal2bracketexpr)
 bal2str = r'(?:[^()\[\]]|%s|%s)+' % (bal2parenexpr, bal2bracketexpr)
 bal2strnospace = r'(?:[^ ()\[\]]|%s|%s)+' % (bal2parenexpr, bal2bracketexpr)
 
+# RE to split off quoted strings and comments.
+# FIXME: The handling of backslashes in raw strings is slightly wrong;
+# I think we only want to look for a backslashed quote of the right type.
+# (Or maybe we look for no backslashes at all?)
 stringre = re.compile(r'''(   r?'[']' .*? '[']'   # 3-single-quoted string
                             | r?""" .*? """       # 3-double-quoted string 
                             | r?'[']'.*           # unmatched 3-single-quote
@@ -141,6 +146,8 @@ stringre = re.compile(r'''(   r?'[']' .*? '[']'   # 3-single-quoted string
                             | [#].*               # Python comment
                             | //.*                # Scala comment
                           )''', re.X)
+
+# Test function for above RE.  Not called.
 def teststr(x):
   split = stringre.split(x)
   for y in split:
@@ -149,7 +156,9 @@ def teststr(x):
 triple_quote_delims = ['"""', "'''"]
 single_quote_delims = ['"', "'"]
 
-# If we added a triple-quote delimiter, remove it
+# If we added a triple-quote delimiter, remove it. (We add such delimiters
+# to the beginning of a line if we're in the middle of a multi-line quote,
+# so our string-handling works right.)
 def line_no_added_delim(line, delim):
   if delim:
     assert line[0:3] == delim
@@ -174,6 +183,8 @@ def modline(split):
       prev = split[i-1]
     vv = split[i]
     #debprint("Saw #%d: %s", i, vv)
+
+    # Skip blank sections (e.g. at end of line after a comment)
     if len(vv) == 0:
       yield vv
       continue
@@ -182,10 +193,9 @@ def modline(split):
     # don't try to frob it.
     nofrob = old_openquote and i == 1 and prev == ""
 
-    if i % 2 == 1:
-      # We are looking at a delimiter
+    if i % 2 == 1: # We are looking at a delimiter
 
-      # Look for raw-string prefix
+      # Look for raw-string prefix on strings
       vv2 = vv
       raw = None
       if vv[0] == 'r' and len(vv) > 1 and vv[1] in single_quote_delims:
@@ -193,8 +203,8 @@ def modline(split):
         raw = "r"
       elif vv[0] in single_quote_delims:
         raw = ""
-      if raw is not None:
-        # We're handline some sort of string
+
+      if raw is not None: # We're handline some sort of string
         # Look for (unclosed) triple quote
         triplequote = False
         unclosed = False
@@ -306,15 +316,23 @@ def modline(split):
 
       yield vv
 
+# Indentation of current or latest line
 curindent = 0
+# If not None, a continuation line (line ending in backslash)
 contline = None
-# Unclosed multi-line quote from previous line (''' or """)
+# Status of any unclosed multi-line quotes (''' or """) at end of line
 openquote = None
-# Mismatch in parens so far
+# Same, but for the beginning of the line
+old_openquote = None
+# Mismatch in parens/brackets so far at end of line (includes mismatch from
+# previous lines, so that a value of 0 means we are at the end of a logical
+# line)
 paren_mismatch = 0
+# Same, but for the beginning of the line
+old_paren_mismatch = 0
 # Indent last time paren mismatch was zero
 zero_mismatch_indent = 0
-# Line # last time paren mismatch was zero
+# Source line number last time paren mismatch was zero
 zero_mismatch_lineno = 0
 # Accumulation of line across paren mismatches and multi-line quotes.
 # This will hold the concatenation of all such lines, so that we can
@@ -325,7 +343,7 @@ old_bigline = None
 # Lineno and indent at start of bigline
 bigline_indent = 0
 bigline_lineno = 0
-# Current source line number.  Note the same as a "line index", which is an
+# Current source line number.  Not the same as a "line index", which is an
 # index into the lines[] array. (Not even simply off by 1, because we
 # add extra lines consisting of braces, and do other such changes.)
 lineno = 0
@@ -336,8 +354,11 @@ lineno = 0
 lines = []
 # Number of blank or comment-only lines just seen
 blank_or_comment_line_count = 0
+# Same, not considering current line
 prev_blank_or_comment_line_count = 0
 
+# Store information associated with an indentation block (e.g. an
+# if/def statement); stored into indents[]
 class Indent:
   # startind: Line index of beginning of block-begin statement
   # endind: Line index of end of block-begin statement
@@ -349,10 +370,13 @@ class Indent:
     self.indent = indent
     self.ty = ty
 
+  # Adjust line indices starting at AT up by BY.
   def adjust_lineinds(self, at, by):
     if self.startind >= at: self.startind += by
     if self.endind >= at: self.endind += by
 
+# Store information associated with a class or function definition;
+# stored into defs[]
 class Define:
   # ty: "class" or "def"
   # name: name of class or def
@@ -372,6 +396,7 @@ class Define:
     # Line index of insertion point in companion object
     self.compobj_lineind = None
 
+  # Adjust line indices starting at AT up by BY.
   def adjust_lineinds(self, at, by):
     if self.lineind >= at: self.lineind += by
     if self.compobj_lineind and self.compobj_lineind >= at: self.compobj_lineind += by
@@ -383,20 +408,28 @@ indents = []
 # List, for each currently active function and class define, of Define objects
 defs = []
 
-# Adjust line indices starting at AT up by BY.
+# Adjust line indices starting at AT up by BY.  Used when inserting or
+# deleting lines from lines[].
 def adjust_lineinds(at, by):
   for d in defs:
     d.adjust_lineinds(at, by)
   for i in indents:
     i.adjust_lineinds(at, by)
 
+# Output a warning for the user.
 def warning(text, nonl=False):
   '''Line errprint() but also add "Warning: " and line# to the beginning.'''
   errprint("Warning: %d: %s" % (lineno, text), nonl=nonl)
 
+
+################# Main loop
+
+
+# Loop over all lines in stdin or argument(s)
 for line in fileinput.input(args):
   lineno += 1
 
+  # Remove LF or CRLF, convert tabs to spaces
   line = line.rstrip("\r\n").expandtabs()
   #debprint("Saw line: %s", line)
   # If previous line was continued, add it to this line
@@ -420,6 +453,7 @@ for line in fileinput.input(args):
     contline = line_no_added_delim(line, openquote)[0:-1]
     continue
 
+  # Look for blank or comment-only lines
   blankline = re.match(r'^ *$', line)
   if re.match('^ *(#.*|//.*)?$', line):
     blank_or_comment_line_count += 1
@@ -427,12 +461,13 @@ for line in fileinput.input(args):
     prev_blank_or_comment_line_count = blank_or_comment_line_count
     blank_or_comment_line_count = 0
 
-  # Record original line, and values of paren_mismatch at start of line
+  # Record original line, and values of paren_mismatch and openquote
+  # at start of line
   old_paren_mismatch = paren_mismatch
   oldline = line
   old_openquote = openquote
 
-  # Count # of mismatched parens
+  # Count # of mismatched parens (also brackets)
   for i in xrange(len(splitline)):
     vv = splitline[i]
     if i % 2 == 0: # Make sure not a quoted string or comment
@@ -446,6 +481,9 @@ for line in fileinput.input(args):
     warning("Apparent unmatched right-paren, we might be confused: %s" % line)
     paren_mismatch = 0
 
+  # Compute current indentation, handle dedenting (may need to insert braces).
+  # Note that blank lines don't have any effect on indentation in Python,
+  # and nor do continued multi-line quotes.
   if not old_openquote and not blankline:
     # Get current indentation
     m = re.match('( *)', line)
@@ -493,9 +531,10 @@ for line in fileinput.input(args):
       # Pop off all function definitions that have been closed
       while defs and defs[-1].indent >= indent:
         defs.pop()
+    # Set indentation value for current line
     curindent = indent
 
-  # Record some values if no paren mismatch at start of line
+  # Record some values if no paren mismatch or continued quote at start of line
   if not old_openquote and old_paren_mismatch == 0:
     zero_mismatch_indent = curindent
     zero_mismatch_lineno = lineno
@@ -516,7 +555,7 @@ for line in fileinput.input(args):
   # Frob the line in various ways (e.g. change 'and' to '&&')
   line = ''.join(modline(splitline))
 
-  # Accumulate a line across unmatched parens and quotes
+  # Accumulate a logical line into 'bigline' across unmatched parens and quotes
   line_without_delim = line_no_added_delim(line, old_openquote)
   old_line_without_delim = line_no_added_delim(oldline, old_openquote)
   if old_paren_mismatch == 0 and not old_openquote:
@@ -531,26 +570,31 @@ for line in fileinput.input(args):
     bigline = bigline + "\n" + line_without_delim
     old_bigline = old_bigline + "\n" + old_line_without_delim
 
-  # Handle blocks.
-  
   # If we see a Scala-style opening block, just note it; important for
   # unmatched-paren handling above (in particular where we reset the
   # unmatched-paren count at the beginning of a block, to deal with
   # errors in parsing)
-  if paren_mismatch == 0 and not openquote and re.match(r'.*\{ *$', splitline[-1]):
+  if paren_mismatch == 0 and not openquote and (
+      re.match(r'.*\{ *$', splitline[-1])):
     indents += [Indent(len(lines), len(lines) + (bigline or "").count('\n'),
       zero_mismatch_indent, "scala")]
 
+  # Error recovery.  If we see a Python block opening, and we're not in
+  # a continued quote, and we were inside a parened or bracketed expr,
+  # something is probably wrong, so reset paren count.
   if not old_openquote and old_paren_mismatch > 0 and \
       re.match(r' *(if|for|with|while|try|elif|else|except|def|class) +.*:.*$',
                line):
-    # Can happen, e.g., if // is used in Python to mean "integer division",
-    # or other circumstances where we got confused
+    # Can happen, e.g., if // is used in Python to mean "integer division"
+    # but we interpret it as a comment (so a closing paren gets ignored),
+    # or other circumstances where we got confused or the user actually
+    # messed up their parens
     warning("Apparent unmatched left-paren somewhere before, possibly line %d, we might be confused" % zero_mismatch_lineno)
-    # Reset to only mismatched left parens on this line
+    # Reset to only mismatched parens on this line
     paren_mismatch = paren_mismatch - old_paren_mismatch
     if paren_mismatch < 0:
       paren_mismatch = 0
+    # Restart the logical line, add any old line to lines[]
     add_bigline(bigline)
     bigline = line
     old_bigline = oldline
@@ -559,9 +603,12 @@ for line in fileinput.input(args):
   if paren_mismatch > 0 or openquote:
     continue
 
+  ######### Handle blocks.
+  
   front, body, back = "", "", ""
   frontbody = bigline
-  # Look for a statement introducing a body
+  # Look for a Python statement introducing a block.  Split off leading
+  # indentation and trailing spaces.
   m = re.match(r'(\s*)(.*?)\s*:\s*$', frontbody, re.S)
   if m:
     front, body = m.groups()
@@ -574,6 +621,8 @@ for line in fileinput.input(args):
       if m:
         front, body = m.groups()
         back = " " + newback
+
+  # FIXME: Don't yet handle single-line if statements, e.g. 'if foo: bar'
 
   # Check for def/class and note function arguments.  We do this separately
   # from the def check below so we find both def and class, and both
@@ -792,6 +841,8 @@ for line in fileinput.input(args):
           bigline = None
 
     break
+
+  # Store logical line or modified block-start line into lines[]
   if bigline is None:
     continue
   if newblock:
@@ -802,6 +853,7 @@ for line in fileinput.input(args):
     add_bigline(bigline)
   bigline = None
 
+# At the end, output all lines
 for line in lines:
   print line
 
