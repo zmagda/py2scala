@@ -400,10 +400,15 @@ class Define:
 
   # Adjust line indices starting at AT up by BY.
   def adjust_lineinds(self, at, by):
+    #debprint("Adjusting lines at %s by %s", at, by)
     if self.lineind >= at: self.lineind += by
     if self.compobj_lineind and self.compobj_lineind >= at: self.compobj_lineind += by
     for (k, v) in self.vardict.iteritems():
-      if type(v) is int and v >= at: self.vardict[k] += v
+      if type(v) is int and v >= at: self.vardict[k] += by
+    #debprint("Finishing adjusting lines at %s by %s, len(lines)=%s", at, by,
+    #    len(lines))
+    #for (k, v) in self.vardict.iteritems():
+    #  debprint("name=%s, vardict[%s] = %s", self.name, k, v)
 
 # List of currently active indentation blocks, of Indent objects
 indents = []
@@ -832,7 +837,7 @@ for line in fileinput.input(args):
             bigline = None
         if ok_to_var_self and bigline.strip().startswith('val '):
           # If we've seen a self.* variable assignment, move it outside of the
-          # init statement.
+          # init statement, along with any comments.
           bigline = ' '*dd.indent + bigline.lstrip()
           inslines = bigline.split('\n')
           inspoint = dd.lineind
@@ -840,6 +845,15 @@ for line in fileinput.input(args):
           adjust_lineinds(inspoint, len(inslines))
           if type(curvardict[newvar]) is int:
             curvardict[newvar] = inspoint
+          if prev_blank_or_comment_line_count > 0:
+            # Move comments, but beforehand fix indentation
+            for i in xrange(prev_blank_or_comment_line_count):
+              lines[-i] = re.sub(r'^( *)', ' '*dd.indent, lines[-i])
+            lines[inspoint:inspoint] = (
+                lines[-prev_blank_or_comment_line_count:])
+            adjust_lineinds(inspoint, prev_blank_or_comment_line_count)
+            del lines[-prev_blank_or_comment_line_count:]
+            adjust_lineinds(len(lines)+1, -prev_blank_or_comment_line_count)
           bigline = None
 
     break
