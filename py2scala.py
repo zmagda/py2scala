@@ -336,6 +336,8 @@ old_paren_mismatch = 0
 zero_mismatch_indent = 0
 # Source line number last time paren mismatch was zero
 zero_mismatch_lineno = 0
+# Blank/comment count last time paren mistmatch was zero
+zero_mismatch_prev_blank_or_comment_line_count = 0
 # Accumulation of line across paren mismatches and multi-line quotes.
 # This will hold the concatenation of all such lines, so that we can
 # properly handle multi-line if/def/etc. statements and variable assignments.
@@ -545,6 +547,7 @@ for line in fileinput.input(args):
   if not old_openquote and old_paren_mismatch == 0:
     zero_mismatch_indent = curindent
     zero_mismatch_lineno = lineno
+    zero_mismatch_prev_blank_or_comment_line_count = prev_blank_or_comment_line_count
 
   ########## Now we modify the line itself
 
@@ -827,12 +830,15 @@ for line in fileinput.input(args):
             lines[inspoint:inspoint] = inslines
             adjust_lineinds(inspoint, len(inslines))
             curvardict[newvar] = inspoint
-            if prev_blank_or_comment_line_count > 0:
+            bcomcount = zero_mismatch_prev_blank_or_comment_line_count
+            #debprint("Moving var %s, lineno=%s, bcomcount=%s",
+            #    newvar, lineno, bcomcount)
+            if bcomcount > 0:
               lines[inspoint:inspoint] = (
-                  lines[-prev_blank_or_comment_line_count:])
-              adjust_lineinds(inspoint, prev_blank_or_comment_line_count)
-              del lines[-prev_blank_or_comment_line_count:]
-              adjust_lineinds(len(lines)+1, -prev_blank_or_comment_line_count)
+                  lines[-bcomcount:])
+              adjust_lineinds(inspoint, bcomcount)
+              del lines[-bcomcount:]
+              adjust_lineinds(len(lines)+1, -bcomcount)
 
             bigline = None
         if ok_to_var_self and bigline.strip().startswith('val '):
@@ -845,15 +851,16 @@ for line in fileinput.input(args):
           adjust_lineinds(inspoint, len(inslines))
           if type(curvardict[newvar]) is int:
             curvardict[newvar] = inspoint
-          if prev_blank_or_comment_line_count > 0:
+          bcomcount = zero_mismatch_prev_blank_or_comment_line_count
+          if bcomcount > 0:
             # Move comments, but beforehand fix indentation
-            for i in xrange(prev_blank_or_comment_line_count):
-              lines[-i] = re.sub(r'^( *)', ' '*dd.indent, lines[-i])
+            for i in xrange(bcomcount):
+              lines[-(i+1)] = re.sub(r'^( *)', ' '*dd.indent, lines[-(i+1)])
             lines[inspoint:inspoint] = (
-                lines[-prev_blank_or_comment_line_count:])
-            adjust_lineinds(inspoint, prev_blank_or_comment_line_count)
-            del lines[-prev_blank_or_comment_line_count:]
-            adjust_lineinds(len(lines)+1, -prev_blank_or_comment_line_count)
+                lines[-bcomcount:])
+            adjust_lineinds(inspoint, bcomcount)
+            del lines[-bcomcount:]
+            adjust_lineinds(len(lines)+1, -bcomcount)
           bigline = None
 
     break
