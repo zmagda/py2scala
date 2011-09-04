@@ -767,55 +767,89 @@ for line in fileinput.input(args):
     #debprint("About to check for vars, line %d, fun %s",
     #    lineno, defs and defs[-1].name)
     if defs and paren_mismatch == 0:
+      # Retrieve most recent def/class definition
       dd = defs[-1]
       #debprint("Checking for vars, line %d, old_bigline[%s], bigline[%s]", lineno, old_bigline, bigline)
-      # Make sure we see a variable assignment in both the unfrobbed and
-      # frobbed lines, so that we ignore cases where we removed a `self.'.
-      assignre = re.compile('(\s*)(val\s+|var\s+|)((?:self\.)?[a-zA-Z_][a-zA-Z_0-9]*)(\s*[+\-*/]?=)(.*)', re.S)
+
+      # We might have removed a 'self.' from a variable assignment, if
+      # --remove-self was given.  But we want to know whether the assignment
+      # was a self.* variable.  So we first look for an assignment in the
+      # unfrobbed line, and if so, retrieve the variable name, and then
+      # look at the frobbed line to get everything else (in particular,
+      # the RHS, which might have been frobbed).
+      assignre = re.compile('(\s*)(val\s+|var\s+|)((?:self\.|cls\.)?[a-zA-Z_][a-zA-Z_0-9]*)(\s*[+\-*/]?=)(.*)', re.S)
       m = assignre.match(old_bigline)
       if m:
-        (_, _, newvar, _, _) = m.groups()
+        (_, _, varvar, _, _) = m.groups()
         m = assignre.match(bigline)
       if m:
         (newindent, newvaldecl, _, neweq, newrhs) = m.groups()
-        #debprint("lineno: %d, Saw var: %s", lineno, newvar)
-        is_self = newvar.startswith("self.")
+        #debprint("lineno: %d, Saw var: %s", lineno, varvar)
+        is_self = varvar.startswith("self.") or varvar.startswith("cls.")
+        # An assignment rather than a += or whatever
         is_assign = neweq.strip() == '='
+        # If this a Python-style variable assignment at class level?  If so,
+        # it's a class var, and we will move it to the companion object
+        is_new_class_var = (not newvaldecl and is_assign and
+            dd.ty == 'class' and not is_self)
+        # If a class var, give it a 'cls.' prefix in the variable-assignment
+        # dictionary, so we can match later refs to the var.  After this,
+        # 'varvar' is the name of the var as recorded in the vardict, but
+        # 'orig_varvar' is the actual name of the var in the text of the
+        # program.
+        orig_varvar = varvar
+        if is_new_class_var:
+          varvar = 'cls.' + varvar
+        # Don't add var/val to a self.foo assignment unless it's in an
+        # __init__() method (in which case it gets moved to class scope)
         ok_to_var_self = is_self and dd.ty == 'def' and dd.name == '__init__'
         curvardict = dd.vardict
         if is_self:
-          # For a self.* variable, find the class vardict
+          # For a self.* variable, find the class vardict instead of the
+          # vardict of the current function.
           i = len(defs) - 1
           while i > 0 and defs[i].ty != 'class':
             i -= 1
             curvardict = defs[i].vardict
         if newvaldecl:
-          # Already seen val/var decl
-          if newvar in curvardict:
-            warning("Apparent redefinition of variable %s" % newvar)
+          # The text had an explicit var/val decl (Scala-style)
+          if varvar in curvardict:
+            warning("Apparent redefinition of variable %s" % varvar)
           else:
             # Signal not to try and change val to var
-            curvardict[newvar] = "explicit"
+            curvardict[varvar] = "explicit"
         else:
-          #debprint("newvar: %s, curvardict: %s", newvar, curvardict)
-          if newvar not in curvardict:
+          # This is a Python-style variable (no declaration), or Scala-style
+          # assignment to existing variable.
+          #debprint("varvar: %s, curvardict: %s", varvar, curvardict)
+          if varvar not in curvardict:
             if not is_assign:
-              warning("Apparent attempt to modify non-existent variable %s" % newvar)
+              # We saw 'foo += 1' or similar, but no previous assignment
+              # to 'foo'.
+              warning("Apparent attempt to modify non-existent variable %s" % varvar)
             else:
-              curvardict[newvar] = len(lines)
+              # First time we see an assignment.  Convert to a Scala
+              # declaration and record the number.  We convert it to 'val',
+              # but we may go back later and change to 'var'.
+              curvardict[varvar] = len(lines)
               if not is_self or ok_to_var_self:
-                bigline = "%sval %s%s%s%s" % (newindent, newvaldecl, newvar, neweq, newrhs)
+                bigline = "%sval %s%s%s%s" % (newindent, newvaldecl, orig_varvar, neweq, newrhs)
           else:
-            vardefline = curvardict[newvar]
+            # Variable is being reassigned, so change declaration to 'var'.
+            vardefline = curvardict[varvar]
             if vardefline == "val":
-              warning("Attempt to set function parameter %s" % newvar)
+              warning("Attempt to set function parameter %s" % varvar)
             elif type(vardefline) is int:
               #debprint("Subbing var for val in [%s]", lines[vardefline])
               lines[vardefline] = re.sub(r'^( *)val ', r'\1var ',
                 lines[vardefline])
-          if is_assign and dd.ty == 'class' and not is_self:
-            # Move the variable (and preceding comments) to the companion object
+          if is_new_class_var:
+            # Bare assignment to variable at class level, without 'var/val'.
+            # This is presumably a Python-style class var, so move the
+            # variable (and preceding comments) to the companion object,
+            # creating one if necessary.
             if dd.compobj_lineind is None:
+              # We need to create a companion object.
               lines[dd.lineind:dd.lineind] = \
                   ['%sobject %s {' % (' '*dd.indent, dd.name),
                    '%s}' % (' '*dd.indent),
@@ -825,14 +859,16 @@ for line in fileinput.input(args):
               adjust_lineinds(dd.lineind, 3)
               assert dd.lineind == old_lineind + 3
               dd.compobj_lineind = dd.lineind - 2
+            # Now move the variable assignment itself.
             inslines = bigline.split('\n')
             inspoint = dd.compobj_lineind
             lines[inspoint:inspoint] = inslines
             adjust_lineinds(inspoint, len(inslines))
-            curvardict[newvar] = inspoint
+            curvardict[varvar] = inspoint
+            # Also move any blank or comment lines directly before.
             bcomcount = zero_mismatch_prev_blank_or_comment_line_count
             #debprint("Moving var %s, lineno=%s, bcomcount=%s",
-            #    newvar, lineno, bcomcount)
+            #    varvar, lineno, bcomcount)
             if bcomcount > 0:
               lines[inspoint:inspoint] = (
                   lines[-bcomcount:])
@@ -842,15 +878,16 @@ for line in fileinput.input(args):
 
             bigline = None
         if ok_to_var_self and bigline.strip().startswith('val '):
-          # If we've seen a self.* variable assignment, move it outside of the
-          # init statement, along with any comments.
+          # If we've seen a self.* variable assignment in an __init__()
+          # function, move it outside of the init statement, along with
+          # any comments.
           bigline = ' '*dd.indent + bigline.lstrip()
           inslines = bigline.split('\n')
           inspoint = dd.lineind
           lines[inspoint:inspoint] = inslines
           adjust_lineinds(inspoint, len(inslines))
-          if type(curvardict[newvar]) is int:
-            curvardict[newvar] = inspoint
+          if type(curvardict[varvar]) is int:
+            curvardict[varvar] = inspoint
           bcomcount = zero_mismatch_prev_blank_or_comment_line_count
           if bcomcount > 0:
             # Move comments, but beforehand fix indentation
