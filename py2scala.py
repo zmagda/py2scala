@@ -33,6 +33,42 @@ import optparse
 
 ###########################################################################
 #
+# Comments
+#
+###########################################################################
+
+## General FIXME's for this program:
+
+## -- BUGBUG: In multiline def() with --remove-self, we change 'self' to
+##    'this' but then don't remove 'this'.  Works OK with single-line def().
+## -- Converting this program to use a proper parser would make some
+## conversions easier (e.g. $1 in $2 -> $2 contains $1), and might simplify
+## some of the multiline handling.
+## -- In variable snarfing/fixing-up (e.g. adding var/val), should:
+##    1. Handle cases like (foo, bar) = ..., adding val and noting both
+##       variables so we handle later cases where either var is modified
+##    2. Handle cases like foo, bar = ..., similarly, but MUST add parens
+##       around the variables, i.e. convert to 'val (foo, bar) = ...'
+##    3. Handle cases like val/var (foo, bar) = ..., handling similarly,
+##       but with the same changes we make whenever we've already seen
+##       val/var.
+##    4. Handle cases like val/var foo, bar = ..., which are equivalent
+##       to assigning both foo and bar the entire RHS.
+##    5. (Different subject) Variable declarations introduced inside of
+##       braces will scope only to those braces.  If we see a val/var,
+##       add it but also note the current indent, so that when popping past
+##       that indent level we remove those items.  If we see an assignment
+##       to new variable and have to add our own val/var, we need to keep
+##       in mind that just adding val/var to the same line will cause the
+##       var to have the scope of the enclosing brace.  So we need to
+##       track both assignments and references to variables, and if we see
+##       either, issue a warning indicating that the code will have to be
+##       fixed up manually. (Moving it out automatically is too tricky for
+##       what we're doing here.)
+## -- Handle XML literals properly in Scala code.
+
+###########################################################################
+#
 # Command-line options and usage
 #
 ###########################################################################
@@ -60,22 +96,48 @@ Thus, the program is intended to work as follows:
 
 1. Run it to do a preliminary conversion
 2. Fix up class constructors, add type annotations
-3. Run it again with appropriate options to fix up self references and brackets
+3. Run it again with the -2 (or --second-pass) option to fix up self
+   references and brackets, and not do other changes that might mess up
+   previously Scala-fied code (e.g. changing None to null, since None also
+   has a meaning in Scala).
 
 Currently, parsing is done with regexps rather than context-free.  This means
 that some constructions may not be converted perfectly.  However, strings
 of various sorts (including multiline strings) are usually handled properly;
-likewise multiline block openers and such.
+likewise multiline block openers and such.  However, embedded XML is NOT
+currently handled properly -- or at least, unquoted raw text will get frobbed
+instead of ignored.  You might want to use the PY2SCALA directives to get
+around this (see below).
+
+If the conversion process messes up and changes something that you don't
+want changed, you can override this using a directive something like this:
+  //  !!PY2SCALA: <directive>
+or like this:
+  #   !!PY2SCALA: <directive>
+where <directive> is currently either BEGIN_PASSTHRU (start passing lines
+through without trying to frob them) or END_PASSTHRU (end doing this).  Note
+that the comment sign at the begin is not part of the directive, but simply
+a way of embedding the directive in code.  Likewise the <> signs do not
+appear in the directive command, which uses only uppercase letters, the
+underscore character, and possibly numbers.  Such a directive will be
+recognized anywhere on a line, regardless of what comes before or after --
+that way, it can be embedded in a comment or whatever.  However, it will only
+be recognized if it has exactly the opening tag "!!PY2SCALA: " followed by a
+directive command, and only if the command is one of the recognized ones.
+That way it's highly unlikely such a directive would appear by accident.
 """
 
 parser = optparse.OptionParser(usage=usage)
-parser.add_option("-s", "--remove-self", action="store_true",
+parser.add_option("-s", "--scala", action="store_true",
+                   help="""If true, code is already Scala-fied, so don't do
+conversions that might negatively affect Scala code.""")
+parser.add_option("-r", "--remove-self", "--rs", action="store_true",
                    help="""Remove self.* references and self params.
 Also removes cls.* references and cls params.   Not done by default because
 it removes info necessary for manually converting classes (especially
 constructors) and separating class methods into companion objects.  Useful
 to rerun this program with this option after these things have been done.""")
-parser.add_option("-b", "--convert-brackets", action="store_true",
+parser.add_option("-b", "--convert-brackets", "--cb", action="store_true",
                    help="""Try to convert array refs like foo[i] to Scala-style foo(i).
 Not done by default because it removes info useful for adding type annotations
 to functions.  Useful to rerun this program with this option after doing
@@ -83,12 +145,14 @@ this.  You will still have to convert slices by hand.  This attempts not
 to convert bracket references that are meaningful to Scala (i.e. generic
 type parameters) using the assumption that types in Scala begin with an
 uppercase letter.""")
+parser.add_option("-2", "--second-pass", action="store_true",
+                   help="""Equivalent to -srb.  Used when doing a second pass through already Scala-fied code to remove self.* references and convert brackets to parens for array refs.""")
 
 (options, args) = parser.parse_args()
-
-## FIXME: Converting this program to use a proper parser would make some
-## conversions easier (e.g. $1 in $2 -> $2 contains $1), and might simplify
-## some of the multiline handling.
+if options.second_pass:
+  options.scala = True
+  options.remove_self = True
+  options.convert_brackets = True
 
 ## Process file(s)
 
@@ -137,6 +201,7 @@ bal2strnospace = r'(?:[^ ()\[\]]|%s|%s)+' % (bal2parenexpr, bal2bracketexpr)
 # FIXME: The handling of backslashes in raw strings is slightly wrong;
 # I think we only want to look for a backslashed quote of the right type.
 # (Or maybe we look for no backslashes at all?)
+# FIXME: We don't handle XML literals at all
 stringre = re.compile(r'''(   r?'[']' .*? '[']'   # 3-single-quoted string
                             | r?""" .*? """       # 3-double-quoted string 
                             | r?'[']'.*           # unmatched 3-single-quote
@@ -283,9 +348,10 @@ def modline(split):
       vv = re.sub(r'\band\b', '&&', vv)
       vv = re.sub(r'\bTrue\b', 'true', vv)
       vv = re.sub(r'\bFalse\b', 'false', vv)
-      # Next one maybe questionable; some None should actually be None
-      # (e.g. when Option[Int] is used)
-      vv = re.sub(r'\bNone\b', 'null', vv)
+      # some None in Scala code should actually be None (e.g. when
+      # Option[T] is used)
+      if not options.scala:
+        vv = re.sub(r'\bNone\b', 'null', vv)
       vv = re.sub(r'\bnot ', '!', vv)
       vv = re.sub(r'\bis (None|null)\b', '== null', vv)
       vv = re.sub(r'\bis !.*(None|null)\b', '!= null', vv)
@@ -360,6 +426,8 @@ lines = []
 blank_or_comment_line_count = 0
 # Same, not considering current line
 prev_blank_or_comment_line_count = 0
+# Whether we are ignoring lines due to PY2SCALA directive
+in_ignore_lines = False
 
 # Store information associated with an indentation block (e.g. an
 # if/def statement); stored into indents[]
@@ -448,6 +516,21 @@ for line in fileinput.input(args):
     line = contline.rstrip() + " " + line.lstrip()
     contline = None
                                   
+  m = re.match('.*!!PY2SCALA: ([A-Z_]+)', line)
+  if m:
+    directive = m.group(1)
+    if directive == 'BEGIN_PASSTHRU':
+      in_ignore_lines = True
+      lines += [line]
+      continue
+    elif directive == 'END_PASSTHRU':
+      in_ignore_lines = False
+      lines += [line]
+      continue
+  if in_ignore_lines:
+    lines += [line]
+    continue
+
   # If we are continuing a multiline quote, add the delimiter to the
   # beginning.  That way we will parse the line correctly.  We remove
   # the delimiter at the bottom.
@@ -551,17 +634,6 @@ for line in fileinput.input(args):
 
   ########## Now we modify the line itself
 
-  # Remove self and cls parameters from def(), if called for
-  if options.remove_self:
-    m = re.match(r'^( *def +[A-Za-z0-9_]+)\((?:self|cls)(\)|, *)(.*)$', line)
-    if m:
-      if m.group(2) == ')':
-        line = '%s()%s' % (m.group(1), m.group(3))
-      else:
-        line = '%s(%s' % (m.group(1), m.group(3))
-    if re.match(r'^ *def +__init__\(', line):
-      warning("Need to convert to Scala constructor: %s" % line)
-
   # Frob the line in various ways (e.g. change 'and' to '&&')
   line = ''.join(modline(splitline))
 
@@ -612,6 +684,18 @@ for line in fileinput.input(args):
   # Skip to next line if this line doesn't really end
   if paren_mismatch > 0 or openquote:
     continue
+
+  # Remove self and cls parameters from def(), if called for
+  # Note that we changed 'self' to 'this' above
+  if options.remove_self:
+    m = re.match(r'^(\s*def\s+[A-Za-z0-9_]+\s*)\((?:\s*(?:this|cls)\s*)(\)|, *)(.*)$', bigline)
+    if m:
+      if m.group(2) == ')':
+        bigline = '%s()%s' % (m.group(1), m.group(3))
+      else:
+        bigline = '%s(%s' % (m.group(1), m.group(3))
+    if re.match(r'^ *def +__init__\(', bigline):
+      warning("Need to convert to Scala constructor: %s" % bigline)
 
   ######### Handle blocks.
   
