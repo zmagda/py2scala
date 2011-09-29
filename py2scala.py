@@ -197,7 +197,6 @@ bal2strnospace0 = r'(?:[^ ()\[\]]|%s|%s)*' % (bal2parenexpr, bal2bracketexpr)
 bal2str = r'(?:[^()\[\]]|%s|%s)+' % (bal2parenexpr, bal2bracketexpr)
 bal2strnospace = r'(?:[^ ()\[\]]|%s|%s)+' % (bal2parenexpr, bal2bracketexpr)
 
-errprint("options.scala: %s" % options.scala)
 if options.scala:
   commentre = r''' | /\* .*? \*/  # C-style Scala comment
                    | /\* .*       # C-style Scala comment unmatched (multi-line)
@@ -262,7 +261,7 @@ def modline(split):
     if i > 0:
       prev = split[i-1]
     vv = split[i]
-    debprint("Saw #%d: %s", i, vv)
+    #debprint("Saw #%d: %s", i, vv)
 
     # Skip blank sections (e.g. at end of line after a comment)
     if len(vv) == 0:
@@ -293,7 +292,7 @@ def modline(split):
       for delim in multi_line_delims:
         (delimstart, delimend) = delim
         if vv2.startswith(delimstart):
-          debprint("Saw multi-line delim %s", delimstart)
+          #debprint("Saw multi-line delim %s", delimstart)
           saw_multiline_delim = True
           if vv2 == delimstart or not vv2.endswith(delimend):
             openquote = delimstart
@@ -556,7 +555,7 @@ for line in fileinput.input(args):
   if openquote:
     line = openquote + line
   # Split the line based on quoted and commented sections
-  debprint("Line before splitting: [%s]", line)
+  #debprint("Line before splitting: [%s]", line)
   splitline = list(stringre.split(line))
 
   # If line is continued, don't do anything yet (till we get the whole line)
