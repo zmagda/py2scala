@@ -182,7 +182,7 @@ this can be suppressed using NONL.'''
 
 # A hackish function for print-debugging.
 def debprint(fmt, *vals):
-  errprint("Debug: %s" % (fmt % vals))
+  errprint("Debug: Line %d, %s" % (lineno, fmt % vals))
 
 # RE's for balanced expressions.  This is a major hack.  We only use this
 # for things like converting '$1 in $2' to '$2 contains $1'.  In general,
@@ -197,6 +197,15 @@ bal2strnospace0 = r'(?:[^ ()\[\]]|%s|%s)*' % (bal2parenexpr, bal2bracketexpr)
 bal2str = r'(?:[^()\[\]]|%s|%s)+' % (bal2parenexpr, bal2bracketexpr)
 bal2strnospace = r'(?:[^ ()\[\]]|%s|%s)+' % (bal2parenexpr, bal2bracketexpr)
 
+errprint("options.scala: %s" % options.scala)
+if options.scala:
+  commentre = r''' | /\* .*? \*/  # C-style Scala comment
+                   | /\* .*       # C-style Scala comment unmatched (multi-line)
+                   | //.*         # C++-style Scala comment
+               '''
+else:
+  commentre = r''' | [#].*'''     # Python comment
+
 # RE to split off quoted strings and comments.
 # FIXME: The handling of backslashes in raw strings is slightly wrong;
 # I think we only want to look for a backslashed quote of the right type.
@@ -210,9 +219,8 @@ stringre = re.compile(r'''(   r?'[']' .*? '[']'   # 3-single-quoted string
                             | r?" (?:\\.|[^"])* " # double-quoted string
                             | r?'.*               # unmatched single-quote
                             | r?".*               # unmatched double-quote
-                            | [#].*               # Python comment
-                            | //.*                # Scala comment
-                          )''', re.X)
+                            %s
+                          )''' % commentre, re.X)
 
 # Test function for above RE.  Not called.
 def teststr(x):
@@ -220,7 +228,11 @@ def teststr(x):
   for y in split:
     print y
 
-triple_quote_delims = ['"""', "'''"]
+# List of multi-line delimiters (quotes, comments).  Each entry is a tuple
+# of (start, end) -- this handles comments like /* ... */ properly.
+multi_line_delims = [('"""', '"""'), ("'''", "'''")]
+if options.scala:
+  multi_line_delims += [('/*', '*/')]
 single_quote_delims = ['"', "'"]
 
 # If we added a triple-quote delimiter, remove it. (We add such delimiters
@@ -228,8 +240,9 @@ single_quote_delims = ['"', "'"]
 # so our string-handling works right.)
 def line_no_added_delim(line, delim):
   if delim:
-    assert line[0:3] == delim
-    return line[3:]
+    dlen = len(delim)
+    assert line[0:dlen] == delim
+    return line[dlen:]
   else:
     return line
 
@@ -249,7 +262,7 @@ def modline(split):
     if i > 0:
       prev = split[i-1]
     vv = split[i]
-    #debprint("Saw #%d: %s", i, vv)
+    debprint("Saw #%d: %s", i, vv)
 
     # Skip blank sections (e.g. at end of line after a comment)
     if len(vv) == 0:
@@ -264,6 +277,8 @@ def modline(split):
 
       # Look for raw-string prefix on strings
       vv2 = vv
+      # raw will be None if no quote of any sort here, 'r' if a raw Python
+      # string, '' if non-raw string
       raw = None
       if vv[0] == 'r' and len(vv) > 1 and vv[1] in single_quote_delims:
         vv2 = vv[1:]
@@ -271,20 +286,23 @@ def modline(split):
       elif vv[0] in single_quote_delims:
         raw = ""
 
-      if raw is not None: # We're handline some sort of string
-        # Look for (unclosed) triple quote
-        triplequote = False
-        unclosed = False
-        global openquote
-        for delim in triple_quote_delims:
-          if vv2.startswith(delim):
-            triplequote = True
-            if vv2 == delim or not vv2.endswith(delim):
-              openquote = delim
-              unclosed = True
-        if not unclosed:
-          openquote = None
-        if triplequote:
+      # Look for (unclosed) multi-line quote or comment
+      saw_multiline_delim = False
+      unclosed = False
+      global openquote
+      for delim in multi_line_delims:
+        (delimstart, delimend) = delim
+        if vv2.startswith(delimstart):
+          debprint("Saw multi-line delim %s", delimstart)
+          saw_multiline_delim = True
+          if vv2 == delimstart or not vv2.endswith(delimend):
+            openquote = delimstart
+            unclosed = True
+      if saw_multiline_delim and not unclosed:
+        openquote = None
+
+      if raw is not None: # We're handline some sort of string, frob it
+        if saw_multiline_delim:
           # FIXME!! Python has eight types of strings: Single and triple
           # quoted strings, using both single and double quotes (i.e.
           # ', ", ''', """), as well as the "raw" variants prefixed with r.
@@ -388,7 +406,8 @@ def modline(split):
 curindent = 0
 # If not None, a continuation line (line ending in backslash)
 contline = None
-# Status of any unclosed multi-line quotes (''' or """) at end of line
+# Status of any unclosed multi-line quotes (''' or """) or multi-line comments
+# at end of line
 openquote = None
 # Same, but for the beginning of the line
 old_openquote = None
@@ -537,6 +556,7 @@ for line in fileinput.input(args):
   if openquote:
     line = openquote + line
   # Split the line based on quoted and commented sections
+  debprint("Line before splitting: [%s]", line)
   splitline = list(stringre.split(line))
 
   # If line is continued, don't do anything yet (till we get the whole line)
