@@ -1,0 +1,7 @@
+Conversion is not perfect, and it is completely expected that further manual editing is required.  The idea is to take care of the most common conversions necessary, especially the ones (like adding braces) that are difficult to do with a simple search/replace.
+
+An important property of this program is that it is (largely) idempotent, i.e. if you run it on code that has previously been converted, it should do nothing, and if run on partially converted code it should only convert the remainder.  This is useful for various reasons.  One of them has to do with conversions like removing `self.' or changing bracketed array references to parens that remove useful info.  Eventually we want to make these changes, but before then we may find the unchanged code useful for e.g. redoing class constructors (which are done in a completely different fashion in Python and Scala, and basically need to be converted manually) and adding type annotations to functions (again something to do manually). Thus, the program is intended to work as follows:
+
+1. Run it to do a preliminary conversion
+2. Fix up class constructors, add type annotations
+3. Run it again with appropriate options to fix up self references and brackets
